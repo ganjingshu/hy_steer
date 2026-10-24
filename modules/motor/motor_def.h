@@ -107,6 +107,7 @@ typedef enum
     LK9025,
     HT04,
     DM,
+    LZ,
 } Motor_Type_e;
 
 /**

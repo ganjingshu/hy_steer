@@ -13,16 +13,16 @@
 #define ROBOT_DEF_H
 
 #include "ins_task.h"
-#include "vision_process.h"
+#include "master_process.h"
 #include "stdint.h"
 
 /* 开发板类型定义,烧录时注意不要弄错对应功能;修改定义后需要重新编译,只能存在一个定义! */
-// #define ONE_BOARD // 单板控制整车
+#define ONE_BOARD // 单板控制整车
 // #define CHASSIS_BOARD //底盘板
-#define GIMBAL_BOARD  //云台板
+// #define GIMBAL_BOARD  //云台板
 
-//#define VISION_USE_VCP  // 使用虚拟串口发送视觉数据
-#define VISION_USE_UART // 使用串口发送视觉数据
+#define VISION_USE_VCP  // 使用虚拟串口发送视觉数据
+// #define VISION_USE_UART // 使用串口发送视觉数据
 
 /* 机器人重要参数定义,注意根据不同机器人进行修改,浮点数需要以.0或f结尾,无符号以u结尾 */
 // 云台参数
@@ -35,7 +35,7 @@
 #define YAW_MAX_ANGLE 62.5f         // 云台水平旋转方向最大角度 (注意反馈如果是陀螺仪，则填写陀螺仪的角度)
 #define YAW_MIN_ANGLE -62.5f        // 云台水平旋转方向最小角度 (注意反馈如果是陀螺仪，则填写陀螺仪的角度)
 // 发射参数
-#define ONE_BULLET_DELTA_ANGLE 45.0f    // 发射一发弹丸拨盘转动的距离,由机械设计图纸给出
+#define ONE_BULLET_DELTA_ANGLE 36.0f    // 发射一发弹丸拨盘转动的距离,由机械设计图纸给出
 #define REDUCTION_RATIO_LOADER 49.0f // 拨盘电机的减速比,英雄需要修改为3508的19.0f
 #define NUM_PER_CIRCLE 8             // 拨盘一圈的装载量
 // 机器人底盘修改的参数,单位为mm(毫米)
@@ -86,9 +86,11 @@ typedef enum
 typedef enum
 {
     CHASSIS_ZERO_FORCE = 0,    // 电流零输入
-    CHASSIS_NO_FOLLOW,         // 不跟随，允许全向平移
-    CHASSIS_ROTATE,            // 小陀螺模式
-    CHASSIS_FOLLOW_GIMBAL_YAW, // 跟随模式，底盘叠加角度环控制
+    CHASSIS_FREE_MODE,        // 自由模式
+    CHASSIS_NO_FOLLOW,        // 底盘云台分离,底盘不跟随
+    CHASSIS_FOLLOW_GIMBAL_YAW,// 底盘跟随云台
+    CHASSIS_ROTATE,           // 小陀螺模式
+    CHASSIS_DEBUG_MODE,             // 零食底盘Debug模式
 } chassis_mode_e;
 
 // 云台模式设置
@@ -97,6 +99,7 @@ typedef enum
     GIMBAL_ZERO_FORCE = 0, // 电流零输入
     GIMBAL_FREE_MODE,      // 云台自由运动模式,即与底盘分离(底盘此时应为NO_FOLLOW)反馈值为电机total_angle;似乎可以改为全部用IMU数据?
     GIMBAL_GYRO_MODE,      // 云台陀螺仪反馈模式,反馈值为陀螺仪pitch,total_yaw_angle,底盘可以为小陀螺和跟随模式
+    GIMBAL_DEBUG_MODE,          // 零食云台Debug模式
 } gimbal_mode_e;
 
 // 发射模式设置
@@ -124,6 +127,7 @@ typedef enum
     LOAD_1_BULLET,  // 单发
     LOAD_3_BULLET,  // 三发
     LOAD_BURSTFIRE, // 连发
+    LOAD_stovepipe, // 卡弹反拨(与LOAD_REVERSE行为一致,独立命名供cmd层卡弹标志使用)
 } loader_mode_e;
 
 // 功率限制,从裁判系统获取,是否有必要保留?
@@ -147,6 +151,9 @@ typedef struct
     float offset_angle; // 底盘和归中位置的夹角
     chassis_mode_e chassis_mode;
     int chassis_speed_buff;
+
+    float debug_data;   // debug数据，用于各种用途（电流，速度等）
+    uint8_t debug_flag; // debug传输标志位，用于传输给其他模块切换不同模式（开启数据输出等）
     // UI部分
     //  ...
 
@@ -157,6 +164,9 @@ typedef struct
 { // 云台角度控制
     float yaw;
     float pitch;
+    float yaw_vel;   // yaw角速度前馈
+    float pitch_vel; // pitch角速度前馈
+    float roll_vel;  // roll目标转速(纯速度环),单位dps
     float dm_yaw;
     float chassis_rotate_wz;
 
@@ -206,6 +216,8 @@ typedef struct
 
 typedef struct
 {
+    float loader_angle;     // 拨盘角度
+    float loader_current;   // 拨盘电流
     // code to go here
     // ...
 } Shoot_Upload_Data_s;

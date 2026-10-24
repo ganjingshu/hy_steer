@@ -69,6 +69,8 @@ typedef struct _
     // 接收的回调函数,用于解析接收到的数据
     void (*can_module_callback)(struct _ *); // callback needs an instance to tell among registered ones
     void *id;                                // 使用can外设的模块指针(即id指向的模块拥有此can实例,是父子关系)
+    uint32_t rx_id_mask;                     // 接收ID匹配掩码,由CANRegister填入(rx_id_mask为0时自动设为0x1FFFFFFF精确匹配)
+    uint32_t rx_identifier;                  // 最近一次实际接收到的帧ID,扩展帧ID可能携带状态/故障位,与注册的rx_id不同
 } CANInstance;
 #pragma pack()
 
@@ -84,6 +86,8 @@ typedef struct
     uint32_t rx_id;                             // 接收id
     void (*can_module_callback)(CANInstance *); // 处理接收数据的回调函数
     void *id;                                   // 拥有can实例的模块地址,用于区分不同的模块(如果有需要的话),如果不需要可以不传入
+    uint8_t id_type;                            // 帧ID类型:0=标准帧(默认),非0=扩展帧(仅FDCAN支持,如灵足RS00私有协议)
+    uint32_t rx_id_mask;                        // 接收ID匹配掩码:0=精确匹配(默认);扩展帧反馈ID携带状态位时,用掩码屏蔽状态位后再匹配(如RS00反馈帧填0x1F00FFFF)
 } CAN_Init_Config_s;
 
 /**

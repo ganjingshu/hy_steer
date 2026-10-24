@@ -53,10 +53,23 @@ static void DMMotorDecode(CANInstance *motor_can)
 
     measure->T_Mos = (float)rxbuff[6];
     measure->T_Rotor = (float)rxbuff[7];
+
+    // DM4310编码器位置范围为0-4π(两圈),转换为角度单位,并处理跨边界的圈数累计,
+    // 防止位置环在边界处出现角度跳变(与DJI电机的多圈处理同理,判断阈值取半圈位置)
+    measure->angle_single_round = measure->position * RAD_2_DEGREE; // 0-720°
+    if (measure->position - measure->last_position > 2.0f * PI)
+        measure->total_round--;
+    else if (measure->position - measure->last_position < -2.0f * PI)
+        measure->total_round++;
+    measure->total_angle = measure->total_round * 720.0f + measure->angle_single_round;
+    measure->speed_dps = measure->velocity * RAD_2_DEGREE; // 转换成°/s,与角度环输出单位保持一致
 }
 
 static void DMMotorLostCallback(void *motor_ptr)
 {
+    DMMotorInstance *motor = (DMMotorInstance *)motor_ptr;
+    uint16_t can_bus = motor->motor_can_instace->can_handle == &hcan1 ? 1 : 2;
+    LOGWARNING("[dmmotor] Motor lost, can bus [%d] , id [%d]", can_bus, motor->motor_can_instace->tx_id);
 }
 void DMMotorCaliEncoder(DMMotorInstance *motor)
 {
@@ -115,33 +128,77 @@ void DMMotorOuterLoop(DMMotorInstance *motor, Closeloop_Type_e type)
     motor->motor_settings.outer_loop_type = type;
 }
 
+/* 修改电机的实际闭环反馈来源,与DJIMotorChangeFeed行为一致 */
+void DMMotorChangeFeed(DMMotorInstance *motor, Closeloop_Type_e loop, Feedback_Source_e type)
+{
+    if (loop == ANGLE_LOOP)
+        motor->motor_settings.angle_feedback_source = type;
+    else if (loop == SPEED_LOOP)
+        motor->motor_settings.speed_feedback_source = type;
+    else
+        LOGERROR("[dmmotor] loop type error, check memory access and func param");
+}
 
-//@Todo: 目前只实现了力控，更多位控PID等请自行添加
+// 位置/速度/力矩串级PID,与DJI电机控制结构保持一致:
+// 角度环输出°/s,速度环输出Nm,最终以MIT模式(Kp=Kd=0)下发力矩
+// 若close_loop_type未启用任何闭环,则pid_ref直接作为力矩指令,等价于原纯力控模式
 void DMMotorTask(void const *argument)
 {
-    float  pid_ref, set;
+    float pid_ref, pid_measure, set;
     DMMotorInstance *motor = (DMMotorInstance *)argument;
-   //DM_Motor_Measure_s *measure = &motor->measure;
+    DM_Motor_Measure_s *measure = &motor->measure;
     Motor_Control_Setting_s *setting = &motor->motor_settings;
-    //CANInstance *motor_can = motor->motor_can_instace;
-    //uint16_t tmp;
     DMMotor_Send_s motor_send_mailbox;
     while (1)
     {
         pid_ref = motor->pid_ref;
-        
-        set = pid_ref;
         if (setting->motor_reverse_flag == MOTOR_DIRECTION_REVERSE)
-            set *= -1;
-       
+            pid_ref *= -1;
+
+        // 计算位置环,只有启用位置环且外层闭环为位置时才会计算
+        if ((setting->close_loop_type & ANGLE_LOOP) && setting->outer_loop_type == ANGLE_LOOP)
+        {
+            if (setting->angle_feedback_source == OTHER_FEED)
+                pid_measure = *motor->other_angle_feedback_ptr;
+            else
+                pid_measure = measure->total_angle; // MOTOR_FEED,对total angle闭环,防止在边界处出现突跃
+            // 更新pid_ref进入下一个环
+            pid_ref = PIDCalculate(&motor->angle_PID, pid_measure, pid_ref);
+        }
+
+        // 计算速度环,(外层闭环为速度或位置)且(启用速度环)时才会计算
+        if ((setting->close_loop_type & SPEED_LOOP) && (setting->outer_loop_type & (ANGLE_LOOP | SPEED_LOOP)))
+        {
+            if (setting->feedforward_flag & SPEED_FEEDFORWARD)
+                pid_ref += *motor->speed_feedforward_ptr;
+
+            if (setting->speed_feedback_source == OTHER_FEED)
+                pid_measure = *motor->other_speed_feedback_ptr;
+            else
+                pid_measure = measure->speed_dps; // MOTOR_FEED
+            // 更新pid_ref进入下一个环
+            pid_ref = PIDCalculate(&motor->speed_PID, pid_measure, pid_ref);
+        }
+
+        // 计算力矩环,反馈只有电机自身传感器(换算后的力矩),目前只要启用了力矩环就计算
+        if (setting->feedforward_flag & CURRENT_FEEDFORWARD)
+            pid_ref += *motor->current_feedforward_ptr;
+        if (setting->close_loop_type & CURRENT_LOOP)
+            pid_ref = PIDCalculate(&motor->current_PID, measure->torque, pid_ref);
+
+        if (setting->feedback_reverse_flag == FEEDBACK_DIRECTION_REVERSE)
+            pid_ref *= -1;
+
+        // 最终输出限幅后作为力矩指令下发
+        set = pid_ref;
         LIMIT_MIN_MAX(set, DM_T_MIN, DM_T_MAX);
         motor_send_mailbox.position_des = float_to_uint(0, DM_P_MIN, DM_P_MAX, 16);
         motor_send_mailbox.velocity_des = float_to_uint(0, DM_V_MIN, DM_V_MAX, 12);
-        motor_send_mailbox.torque_des = float_to_uint(pid_ref, DM_T_MIN, DM_T_MAX, 12);
+        motor_send_mailbox.torque_des = float_to_uint(set, DM_T_MIN, DM_T_MAX, 12);
         motor_send_mailbox.Kp = 0;
         motor_send_mailbox.Kd = 0;
 
-        if(motor->stop_flag == MOTOR_STOP)
+        if (motor->stop_flag == MOTOR_STOP)
             motor_send_mailbox.torque_des = float_to_uint(0, DM_T_MIN, DM_T_MAX, 12);
 
         motor->motor_can_instace->tx_buff[0] = (uint8_t)(motor_send_mailbox.position_des >> 8);
@@ -169,7 +226,7 @@ void DMMotorControlInit()
         char dm_id_buff[2] = {0};
         __itoa(i, dm_id_buff, 10);
         strcat(dm_task_name, dm_id_buff);
-        osThreadDef(dm_task_name, DMMotorTask, osPriorityNormal, 0, 128);
+        osThreadDef(dm_task_name, DMMotorTask, osPriorityNormal, 0, 256); // 串级PID计算需要较大的栈空间
         dm_task_handle[i] = osThreadCreate(osThread(dm_task_name), dm_motor_instance[i]);
     }
 }

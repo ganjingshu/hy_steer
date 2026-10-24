@@ -3,6 +3,7 @@
 
 #include "FreeRTOS.h"
 #include "dmmotor.h"
+#include "lzmotor.h"
 #include "task.h"
 #include "main.h"
 #include "cmsis_os.h"
@@ -11,11 +12,10 @@
 #include "ins_task.h"
 #include "motor_task.h"
 #include "referee_task.h"
-#include "vision_process.h"
+#include "master_process.h"
 #include "daemon.h"
 #include "HT04.h"
 #include "buzzer.h"
-#include "debug.h"
 
 
 #include "bsp_log.h"
@@ -25,14 +25,12 @@ osThreadId robotTaskHandle;
 osThreadId motorTaskHandle;
 osThreadId daemonTaskHandle;
 osThreadId uiTaskHandle;
-osThreadId debugTaskHandle;
 
 void StartINSTASK(void const *argument);
 void StartMOTORTASK(void const *argument);
 void StartDAEMONTASK(void const *argument);
 void StartROBOTTASK(void const *argument);
 void StartUITASK(void const *argument);
-void StartDebugTASK(void const *argument);
 
 /**
  * @brief 初始化机器人任务,所有持续运行的任务都在这里初始化
@@ -56,11 +54,9 @@ void OSTaskInit()
     // osThreadDef(uitask, StartUITASK, osPriorityNormal, 0, 512);
     // uiTaskHandle = osThreadCreate(osThread(uitask), NULL); // 关闭裁判系统UI任务
 
-    osThreadDef(debugtask, StartDebugTASK, osPriorityNormal, 0, 128);
-    osThreadCreate(osThread(debugtask), NULL);
-
     DMMotorControlInit(); // 达妙电机的控制初始化,包括PID参数和CAN通信配置,必须在创建任务之后调用,因为该函数中会创建电机控制的消息队列
     HTMotorControlInit(); // 没有注册HT电机则不会执行
+    LZMotorControlInit(); // 没有注册灵足RS00电机则不会执行
 }
 
 __attribute__((noreturn)) void StartINSTASK(void const *argument)
@@ -77,7 +73,7 @@ __attribute__((noreturn)) void StartINSTASK(void const *argument)
         ins_dt = DWT_GetTimeline_ms() - ins_start;
         if (ins_dt > 1)
             LOGERROR("[freeRTOS] INS Task is being DELAY! dt = [%f]", &ins_dt);
-        // VisionSend(); // 解算完成后发送视觉数据,但是当前的实现不太优雅,后续若添加硬件触发需要重新考虑结构的组织
+        VisionSend(); // 解算完成后发送视觉数据,但是当前的实现不太优雅,后续若添加硬件触发需要重新考虑结构的组织
         osDelay(1);
     }
 }
@@ -130,7 +126,7 @@ __attribute__((noreturn)) void StartROBOTTASK(void const *argument)
         robot_dt = DWT_GetTimeline_ms() - robot_start;
         if (robot_dt > 5)
             LOGERROR("[freeRTOS] ROBOT core Task is being DELAY! dt = [%f]", &robot_dt);
-        osDelay(5);
+        osDelay(1);
     }
 }
 
@@ -144,15 +140,5 @@ __attribute__((noreturn)) void StartUITASK(void const *argument)
         // 每给裁判系统发送一包数据会挂起一次,详见UITask函数的refereeSend()
         UITask();
         osDelay(1); // 即使没有任何UI需要刷新,也挂起一次,防止卡在UITask中无法切换
-    }
-}
-
-__attribute__((noreturn)) void StartDebugTASK(void const *argument)
-{   
-    LOGINFO("[freeRTOS] Debug Task Start");
-    for (;;)
-    {
-        DebugTask();
-        osDelay(100);
     }
 }

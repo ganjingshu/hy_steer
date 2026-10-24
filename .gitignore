@@ -12,3 +12,5 @@
 /**/.jdebug.user
 # 程序（通常是构建工具、包管理器或IDE）为了加速后续操作而创建的本地临时存储目录
 /**/.cache
+# Claude Code 工作配置
+/.claude

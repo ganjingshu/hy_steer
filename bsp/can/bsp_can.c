@@ -35,6 +35,10 @@ static void CANAddFilter(CANInstance *_instance)
 
 #ifdef FDCAN
 	static uint8_t can1_filter_idx = 0, can2_filter_idx = 0 , can3_filter_idx = 0;
+	// 扩展帧不在此配置硬件过滤器(CubeMX未给FDCAN分配扩展帧过滤器槽位,ExtFiltersNbr=0),
+	// 由CANServiceInit中的全局过滤器将不匹配的扩展帧接收进RX FIFO0,再在接收回调中按rx_id/rx_id_mask做软件匹配
+	if (_instance->txconf.IdType == FDCAN_EXTENDED_ID)
+		return;
 	//检查是否超出过滤器设定数量上限
 	if(can1_filter_idx > hfdcan1.Init.StdFiltersNbr || can2_filter_idx>hfdcan2.Init.StdFiltersNbr || can3_filter_idx > hfdcan3.Init.StdFiltersNbr)
 	{
@@ -116,20 +120,20 @@ void CANServiceInit()
 	//HAL_FDCAN_ConfigClockCalibration()
 	HAL_FDCAN_ConfigRxFifoOverwrite(&hfdcan1,FDCAN_RX_FIFO0,FDCAN_RX_FIFO_OVERWRITE);
 	HAL_FDCAN_ConfigRxFifoOverwrite(&hfdcan1,FDCAN_RX_FIFO1,FDCAN_RX_FIFO_OVERWRITE);
-	HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT, FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);//全局过滤器设置
+	HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);//全局过滤器:不匹配的标准帧拒绝,扩展帧接收进FIFO0供软件匹配(私有协议电机)
 	HAL_FDCAN_Start(&hfdcan1);
 	HAL_FDCAN_ActivateNotification(&hfdcan1,FDCAN_RXActiveITs, 0);
 
 	HAL_FDCAN_ConfigRxFifoOverwrite(&hfdcan2,FDCAN_RX_FIFO0,FDCAN_RX_FIFO_OVERWRITE);
 	HAL_FDCAN_ConfigRxFifoOverwrite(&hfdcan2,FDCAN_RX_FIFO1,FDCAN_RX_FIFO_OVERWRITE);
-	HAL_FDCAN_ConfigGlobalFilter(&hfdcan2, FDCAN_REJECT, FDCAN_REJECT, FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);
+	HAL_FDCAN_ConfigGlobalFilter(&hfdcan2, FDCAN_REJECT, FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);
 	HAL_FDCAN_Start(&hfdcan2);
 	HAL_FDCAN_ActivateNotification(&hfdcan2,FDCAN_RXActiveITs, 0);
 
 
 	HAL_FDCAN_ConfigRxFifoOverwrite(&hfdcan3,FDCAN_RX_FIFO0,FDCAN_RX_FIFO_OVERWRITE);
 	HAL_FDCAN_ConfigRxFifoOverwrite(&hfdcan3,FDCAN_RX_FIFO1,FDCAN_RX_FIFO_OVERWRITE);
-	HAL_FDCAN_ConfigGlobalFilter(&hfdcan3, FDCAN_REJECT, FDCAN_REJECT, FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);
+	HAL_FDCAN_ConfigGlobalFilter(&hfdcan3, FDCAN_REJECT, FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);
 	HAL_FDCAN_Start(&hfdcan3);
 	HAL_FDCAN_ActivateNotification(&hfdcan3,FDCAN_RXActiveITs, 0);
 
@@ -179,7 +183,7 @@ CANInstance *CANRegister(CAN_Init_Config_s *config)
     // 进行发送报文的配置
 #ifdef FDCAN
     instance->txconf.Identifier = config->tx_id; 				// 发送id
-    instance->txconf.IdType = FDCAN_STANDARD_ID;  				// 使用标准id,扩展id则使用CAN_ID_EXT(目前没有需求)
+    instance->txconf.IdType = config->id_type ? FDCAN_EXTENDED_ID : FDCAN_STANDARD_ID; // 标准帧/扩展帧,扩展帧用于灵足RS00等私有协议电机
     instance->txconf.TxFrameType = FDCAN_DATA_FRAME,    		// 发送数据帧
     instance->txconf.DataLength = FDCAN_DLC_BYTES_8,    		// 数据长度为8字节
 	instance->txconf.ErrorStateIndicator = FDCAN_ESI_ACTIVE,	// 兼容CAN2.0,错误状态指示器设为主动
@@ -197,6 +201,7 @@ CANInstance *CANRegister(CAN_Init_Config_s *config)
     instance->can_handle = config->can_handle;
     instance->tx_id = config->tx_id; // 好像没用,可以删掉
     instance->rx_id = config->rx_id;
+    instance->rx_id_mask = config->rx_id_mask ? config->rx_id_mask : 0x1FFFFFFF; // 0=精确匹配;扩展帧反馈ID携带状态位时使用掩码
     instance->can_module_callback = config->can_module_callback;
     instance->id = config->id;
 
@@ -276,16 +281,17 @@ static void FDCANFIFOxCallback(FDCAN_HandleTypeDef *_hfdcan, uint32_t fifox)
 		//同步HAL库版本的修改：新版HAL内 HAL_FDCAN_GetRxMessage() 已经将DataLength>>16，此处无需再次右移
 		//rxconf.DataLength 即为DLC值(0~15)
 		DataLength = (rxconf.DataLength <= 15) ? rxconf.DataLength : (rxconf.DataLength >> 16) & 0xF;
-        if(rxconf.RxFrameType==FDCAN_DATA_FRAME && rxconf.IdType==FDCAN_STANDARD_ID)
+        if(rxconf.RxFrameType==FDCAN_DATA_FRAME) // 标准帧和扩展帧都处理,扩展帧由全局过滤器接收进FIFO0
         {
         	for (size_t i = 0; i < idx; ++i)
 			{
-        		// 两者相等说明这是要找的实例
-				if (_hfdcan == can_instance[i]->can_handle && rxconf.Identifier == can_instance[i]->rx_id)
+        		// ID按掩码匹配相等说明这是要找的实例
+				if (_hfdcan == can_instance[i]->can_handle && (rxconf.Identifier & can_instance[i]->rx_id_mask) == (can_instance[i]->rx_id & can_instance[i]->rx_id_mask))
 				{
 					if (can_instance[i]->can_module_callback != NULL) // 回调函数不为空就调用
 					{
-						can_instance[i]->rx_len = DataLength;               // 保存接收到的数据长度
+						can_instance[i]->rx_len = DataLength;                // 保存接收到的数据长度
+						can_instance[i]->rx_identifier = rxconf.Identifier; // 保存实际接收ID,扩展帧ID可能携带状态/故障位
 						memcpy(can_instance[i]->rx_buff, fdcan_rx_buff, can_instance[i]->rx_len); // 消息拷贝到对应实例
 						can_instance[i]->can_module_callback(can_instance[i]);     // 触发回调进行数据解析和处理
 					}

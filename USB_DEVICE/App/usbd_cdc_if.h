@@ -65,7 +65,7 @@
   */
 
 /* USER CODE BEGIN EXPORTED_TYPES */
-
+typedef void (*USBCallback)(uint16_t len); // usb接收/发送完成回调,参数为数据长度
 /* USER CODE END EXPORTED_TYPES */
 
 /**
@@ -109,7 +109,9 @@ extern USBD_CDC_ItfTypeDef USBD_Interface_fops_HS;
 uint8_t CDC_Transmit_HS(uint8_t* Buf, uint16_t Len);
 
 /* USER CODE BEGIN EXPORTED_FUNCTIONS */
-
+uint8_t *CDCGetRxBuffer(void);                  // 获取接收缓冲区指针
+void CDC_RegisterRxCallback(USBCallback cbk);   // 注册接收完成回调(在CDC_Receive_HS中调用)
+void CDC_RegisterTxCallback(USBCallback cbk);   // 注册发送完成回调(在CDC_TransmitCplt_HS中调用)
 /* USER CODE END EXPORTED_FUNCTIONS */
 
 /**

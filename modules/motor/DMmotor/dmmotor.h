@@ -15,17 +15,20 @@
 #define DM_T_MIN  (-18.0f)
 #define DM_T_MAX   18.0f
 
-typedef struct 
+typedef struct
 {
     uint8_t id;
     uint8_t state;
-    float velocity;
-    float last_position;
-    float position;
-    float torque;
+    float velocity;         // 电机速度反馈,rad/s
+    float last_position;    // 上一次位置,用于多圈判断
+    float position;         // 电机绝对位置反馈,rad,范围0-4π(两圈)
+    float torque;           // 电机力矩反馈,Nm
     float T_Mos;
     float T_Rotor;
-    int32_t total_round;
+    int32_t total_round;    // 位置跨边界累计的圈数(每圈720°)
+    float angle_single_round; // 单圈角度,0-720°
+    float total_angle;      // 多圈累计角度,单位°
+    float speed_dps;        // 电机速度反馈,°/s
 }DM_Motor_Measure_s;
 
 typedef struct
@@ -73,4 +76,5 @@ void DMMotorEnable(DMMotorInstance *motor);
 void DMMotorStop(DMMotorInstance *motor);
 void DMMotorCaliEncoder(DMMotorInstance *motor);
 void DMMotorControlInit();
+void DMMotorChangeFeed(DMMotorInstance *motor, Closeloop_Type_e loop, Feedback_Source_e type);
 #endif // !DMMOTOR

@@ -95,7 +95,8 @@ uint8_t UserRxBufferHS[APP_RX_DATA_SIZE];
 uint8_t UserTxBufferHS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
-
+static USBCallback cdc_tx_cbk = NULL; // 发送完成回调
+static USBCallback cdc_rx_cbk = NULL; // 接收完成回调
 /* USER CODE END PRIVATE_VARIABLES */
 
 /**
@@ -264,6 +265,11 @@ static int8_t CDC_Control_HS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 11 */
+  // 数据已写入UserRxBufferHS,先通知应用层解析,再重新武装接收
+  if (cdc_rx_cbk != NULL)
+  {
+    cdc_rx_cbk((uint16_t)*Len);
+  }
   USBD_CDC_SetRxBuffer(&hUsbDeviceHS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceHS);
   return (USBD_OK);
@@ -308,14 +314,30 @@ static int8_t CDC_TransmitCplt_HS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
   uint8_t result = USBD_OK;
   /* USER CODE BEGIN 14 */
   UNUSED(Buf);
-  UNUSED(Len);
   UNUSED(epnum);
+  if (cdc_tx_cbk != NULL)
+  {
+    cdc_tx_cbk((uint16_t)*Len);
+  }
   /* USER CODE END 14 */
   return result;
 }
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
+uint8_t *CDCGetRxBuffer(void)
+{
+  return UserRxBufferHS;
+}
 
+void CDC_RegisterRxCallback(USBCallback cbk)
+{
+  cdc_rx_cbk = cbk;
+}
+
+void CDC_RegisterTxCallback(USBCallback cbk)
+{
+  cdc_tx_cbk = cbk;
+}
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */
 
 /**

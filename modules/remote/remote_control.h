@@ -13,7 +13,7 @@
 #ifndef REMOTE_CONTROL_H
 #define REMOTE_CONTROL_H
 
-// #define USE_MOUSE // 是否使用鼠标数据,如果不使用可以节省一些空间
+#define USE_MOUSE // 是否使用鼠标数据,如果不使用可以节省一些空间
 
 #include <stdint.h>
 #include "main.h"
@@ -99,7 +99,7 @@ typedef enum {
 // @todo 当前结构体嵌套过深,需要进行优化
 typedef struct
 {
-    struct
+    struct // 摇杆/开关/拨轮控制量
     {
         int16_t rocker_l_; // 左水平
         int16_t rocker_l1; // 左竖直

@@ -15,6 +15,8 @@ static Shoot_Ctrl_Cmd_s shoot_cmd_recv; // 来自cmd的发射控制信息
 static Subscriber_t *shoot_sub;
 static Shoot_Upload_Data_s shoot_feedback_data; // 来自cmd的发射控制信息
 
+uint8_t loader_is_reversing = 0; // 卡弹反转标志,由发射模块在检测到卡弹后置1,cmd层据此选择LOAD_stovepipe;当前未接入卡弹检测
+
 // dwt定时,计算冷却用
 static float hibernate_time = 0, dead_time = 0;
 
@@ -23,7 +25,7 @@ void ShootInit()
     // 左摩擦轮
     Motor_Init_Config_s friction_config = {
         .can_init_config = {
-            .can_handle = &hcan1,
+            .can_handle = &hcan2,
         },
         .controller_param_init_config = {
             .speed_PID = {
@@ -91,14 +93,14 @@ void ShootInit()
                 .Kd = 0,
                 .Improve = PID_Integral_Limit,
                 .IntegralLimit = 5000,
-                .MaxOut = 5000,
+                .MaxOut = 7500,
             },
         },
         .controller_setting_init_config = {
             .angle_feedback_source = MOTOR_FEED, .speed_feedback_source = MOTOR_FEED,
             .outer_loop_type = SPEED_LOOP, // 初始化成SPEED_LOOP,让拨盘停在原地,防止拨盘上电时乱转
             .close_loop_type = CURRENT_LOOP | SPEED_LOOP,
-            .motor_reverse_flag = MOTOR_DIRECTION_NORMAL, // 注意方向设置为拨盘的拨出的击发方向
+            .motor_reverse_flag = MOTOR_DIRECTION_REVERSE, // 注意方向设置为拨盘的拨出的击发方向
         },
         .motor_type = M2006 // 英雄使用m3508
     };
@@ -159,13 +161,20 @@ void ShootTask()
     case LOAD_BURSTFIRE:
         DJIMotorOuterLoop(loader, SPEED_LOOP);
         DJIMotorSetRef(loader, shoot_cmd_recv.shoot_rate * ONE_BULLET_DELTA_ANGLE * REDUCTION_RATIO_LOADER);
-        // x颗/秒换算成速度: 已知一圈的载弹量,由此计算出1s需要转的角度,注意换算角速度(DJIMotor的速度单位是angle per second)[°/s]
+        // x颗/秒换算成速度: 已知一圈的载弹量,由此计算出1s需要转的角度,注意换算角速度(DJIMotor的速度单位是angle per second)[°/s]     
         break;
     // 拨盘反转,对速度闭环,后续增加卡弹检测(通过裁判系统剩余热量反馈和电机电流)
     // 也有可能需要从switch-case中独立出来
     case LOAD_REVERSE:
     // todo 后面再加
-        DJIMotorOuterLoop(loader, SPEED_LOOP);
+        DJIMotorOuterLoop(loader, ANGLE_LOOP);
+        DJIMotorSetRef(loader, loader->measure.total_angle - ONE_BULLET_DELTA_ANGLE * REDUCTION_RATIO_LOADER);
+        // ...
+        break;
+    // 卡弹反拨,行为与LOAD_REVERSE一致,由cmd层根据loader_is_reversing标志触发
+    case LOAD_stovepipe:
+        DJIMotorOuterLoop(loader, ANGLE_LOOP);
+        DJIMotorSetRef(loader, loader->measure.total_angle - ONE_BULLET_DELTA_ANGLE * REDUCTION_RATIO_LOADER);
         // ...
         break;
     default:
@@ -215,5 +224,7 @@ void ShootTask()
     }
 
     // TODO 反馈数据,目前暂时没有要设定的反馈数据,后续可能增加应用离线监测以及卡弹反馈
+    shoot_feedback_data.loader_angle = loader->measure.total_angle;
+    shoot_feedback_data.loader_current = loader->measure.real_current;
     PubPushMessage(shoot_pub, (void *)&shoot_feedback_data);
 }

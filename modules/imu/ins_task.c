@@ -18,7 +18,7 @@
 #include "tim.h"
 #include "user_lib.h"
 #include "general_def.h"
-#include "vision_process.h"
+#include "master_process.h"
 #include "arm_math.h"
 
 #define RADIAN_TO_DEGREE 57.295779513f
@@ -170,8 +170,8 @@ void INS_Task(void)
         INS.Roll = QEKF_INS.Roll;
         INS.YawTotalAngle = QEKF_INS.YawTotalAngle;
 
-        VisionSetAltitude(INS.Yaw, INS.Pitch, INS.Gyro[Z], INS.Gyro[X]);
-        VisionSetQuaternion(INS.q[0], INS.q[1], INS.q[2], INS.q[3]);
+        VisionSetAltitude(INS.Yaw, INS.Pitch);
+        VisionSetImuData(INS.q[0], INS.q[1], INS.q[2], INS.q[3], INS.Gyro[Z], INS.Gyro[X]);
     }
 
     // temperature control

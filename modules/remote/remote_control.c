@@ -142,7 +142,7 @@ RC_ctrl_t *RemoteControlInit(UART_HandleTypeDef *rc_usart_handle)
 
     // 进行守护进程的注册,用于定时检查遥控器是否是有效数据
     Daemon_Init_Config_s activity_daemon_conf = {
-        .reload_count = 160, // 1600ms未收到数据视为目前为非活跃状态
+        .reload_count = 320, // 3200ms未收到数据视为目前为非活跃状态
         .callback = RCActivityTimeoutCallback,
         .owner_id = NULL, // 只有1个遥控器,不需要owner_id
     };
