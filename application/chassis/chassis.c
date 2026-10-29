@@ -401,16 +401,19 @@ static void LimitChassisOutput()
 {
     chassis_pid_totaloutput = 0;
     // 估算四个驱动轮(M3508,不含舵向GM6020)的当前功率并累加,功率模型
-    // P = k1·I² + k2·n² + toque_coefficient·n·I + constant(I=速度环输出=电流指令,n=转速rpm),
+    // P = k1·I² + k2·n² + toque_coefficient·n·I + constant(I=电流指令,n=转速rpm),
     // 与下方反解电流的一元二次方程系数(a=k1, b=toque_coefficient·n, c=k2·n²-P+constant)保持一致。
-    // 注意n必须用rpm(speed_aps/6):系数按原框架rpm标定,直接代speed_aps会让k2·n²放大36倍,
-    // 高速轮功率虚高,反解出负电流上限,导致该轮被主动刹车(表现为某个轮明显掉速)
+    // 两个取值要点:
+    // 1) n用rpm(speed_aps/6):系数按原框架rpm标定,直接代speed_aps会让k2·n²放大36倍;
+    // 2) I用PID钳位前的需求(Pout+Iout+Dout)而不是钳位后的Output:若用Output,限流会压低估算功率,
+    //    误判未超限后恢复满电流又再超限,形成bang-bang抖动(表现为功率超限后电机疯转/抽搐)
     for (int i = 0; i < 4; i++)
     {
-        float current_out = chassis_motor_instance[i]->motor_controller.speed_PID.Output;
+        PIDInstance *pid = &chassis_motor_instance[i]->motor_controller.speed_PID;
+        float current_demand = pid->Pout + pid->Iout + pid->Dout;
         float speed_rpm = chassis_motor_instance[i]->measure.speed_aps / 6.0f; // 度每秒→rpm
-        chassis_pid_output[i] = k1 * float_Square(current_out) + k2 * float_Square(speed_rpm) +
-                                toque_coefficient * speed_rpm * current_out + constant_coefficient;
+        chassis_pid_output[i] = k1 * float_Square(current_demand) + k2 * float_Square(speed_rpm) +
+                                toque_coefficient * speed_rpm * current_demand + constant_coefficient;
         if (chassis_pid_output[i] < 0)
             continue; // 负功率=电机发电/制动,不计入消耗
         chassis_pid_totaloutput += chassis_pid_output[i];
@@ -457,27 +460,32 @@ static void LimitChassisOutput()
         for (int i = 0; i < 4; i++)
         {
             chassis_pid_output[i] *= output_zoom_coeff;
+            PIDInstance *pid = &chassis_motor_instance[i]->motor_controller.speed_PID;
             if (chassis_pid_output[i] < 0)
-            {
+            { // 发电/制动轮不消耗功率,不限流,恢复满量程
+                pid->MaxOut = 16384.0f;
                 continue;
             }
 
-            //公式法解力矩功率与实际电机功率的一元二次方程,转速同样用rpm(与累加侧一致)
+            //公式法解力矩功率与实际电机功率的一元二次方程 k1·I²+b·I+c=0,转速用rpm(与累加侧一致)
             float a = k1;
             float speed_rpm = chassis_motor_instance[i]->measure.speed_aps / 6.0f;
             float b = toque_coefficient * speed_rpm;
             float c = k2 * float_Square(speed_rpm) - chassis_pid_output[i] + constant_coefficient;
-            // 解出的允许电流,预算不足或判别式为负时置0(停下该轮),绝不允许负上限(负MaxOut会把该轮钳成刹车)
+            // 只取正根:c<0(预算高于空转底耗)时两根一正一负,正根即允许电流;c>=0说明该轮光维持
+            // 当前转速就已超预算,允许电流置0。注意绝不能取负根的绝对值——那会在最该限流时
+            // 反而给出几千的电流上限(功率越超、电机越疯转的元凶)
             float temp = 0.0f;
-            float discriminant = b * b - 4 * a * c;
-            if (discriminant >= 0.0f)
+            if (c < 0.0f)
             {
-                temp = (-b + sqrt(discriminant)) / (2 * a); // 优先取正根
+                temp = (-b + sqrt(b * b - 4 * a * c)) / (2 * a);
                 if (temp < 0.0f)
-                    temp = (-b - sqrt(discriminant)) / (2 * a); // 正根为负时取另一根
+                    temp = 0.0f;
             }
             // 旧版 DJIMotorSetOutputLimit() 在新版库中不存在,直接限幅速度环输出
-            chassis_motor_instance[i]->motor_controller.speed_PID.MaxOut = abs_limit(fabsf(temp), 13000);
+            pid->MaxOut = abs_limit(temp, 13000);
+            // 抗积分饱和:限流期间把积分钳到当前上限内,否则恢复满电流瞬间Iout释放造成冲击
+            pid->Iout = abs_limit(pid->Iout, pid->MaxOut);
         }
     }
     else
