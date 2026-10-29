@@ -30,7 +30,13 @@
 /* 根据robot_def.h中的macro自动计算的参数 */
 #define HALF_WHEEL_BASE (WHEEL_BASE / 2.0f)     // 半轴距
 #define HALF_TRACK_WIDTH (TRACK_WIDTH / 2.0f)   // 半轮距
-#define PERIMETER_WHEEL (RADIUS_WHEEL * 2 * PI) // 轮子周长
+#define PERIMETER_OMNI_WHEEL (RADIUS_OMNI_WHEEL * 2 * PI)   // 全向轮周长
+#define PERIMETER_STEER_WHEEL (RADIUS_STEER_WHEEL * 2 * PI)  // 舵轮周长
+/* 舵轮驱动速度换算系数:舵轮半径(60mm)小于全向轮(70mm),相同转速下舵轮线速度低,
+   会被全向轮拖着走,转速乘 r_omni/r_steer 使轮缘线速度对齐 */
+#define STEER_DRIVE_SPEED_RATIO (RADIUS_OMNI_WHEEL * 1.0f / RADIUS_STEER_WHEEL)
+/* 小陀螺起转放闸角:刚进入自旋时,前/后舵轮实际几何角都转到该角度以上,四个3508才给速度 */
+#define SPIN_GYRO_READY_ANGLE 85.0f
 
 /* 底盘应用包含的模块和信息存储,底盘是单例模式,因此不需要为底盘建立单独的结构体 */
 #ifdef CHASSIS_BOARD // 如果是底盘板,使用板载IMU获取底盘转动角速度
@@ -58,11 +64,17 @@ static Subscriber_t *shoot_sub; // 发射模块订阅者
 static Shoot_Ctrl_Cmd_s shoot_cmd_recv; // 发射控制命令
 
 static SuperCapInstance *cap;                                       // 超级电容
-static DJIMotorInstance *motor_lf, *motor_rf, *motor_lb, *motor_rb, *steer_lb, *steer_rf; // left right forward back
+static DJIMotorInstance *motor_left, *motor_right, *motor_front, *motor_back, *steer_front, *steer_back; // left right forward back,前后为舵向轮组,左右为全向轮
 
 //调试变量
-static float chassis_lb_v=0; // 底盘lb电机速度
-static float chassis_rb_v=0; // 底盘rb电机速度
+static float chassis_lb_v=0; // 底盘前轮(舵向驱动)电机速度
+static float chassis_rb_v=0; // 底盘后轮(舵向驱动)电机速度
+static float chassis_lf_v=0; // 底盘左全向轮电机速度
+static float chassis_rf_v=0; // 底盘右全向轮电机速度
+static volatile float angle_target_front=0;    // 前舵向目标单圈角(零位+DIR×几何目标角,度)调试用
+static volatile float angle_target_back=0;     // 后舵向目标单圈角(零位+DIR×几何目标角,度)调试用
+static volatile float steer_front_angle_ref=0; // 前舵向角度环设定值(目标多圈角,度)调试用
+static volatile float steer_back_angle_ref=0;  // 后舵向角度环设定值(目标多圈角,度)调试用
 float chassis_lb_speed=400;
 
 static float chassis_pid_output[4];
@@ -105,7 +117,9 @@ static float wrap_180(float x)
 
 /* 私有函数计算的中介变量,设为静态避免参数传递的开销 */
 static float chassis_vx, chassis_vy;                      // 将云台系的速度投影到底盘
-static float vt_lf, vt_rf, vt_lb, vt_rb,angle_lb,angle_rf;                  // 底盘速度解算后的临时输出,待进行限幅
+static float vt_front, vt_back, vt_left, vt_right, angle_front, angle_back;           // 底盘速度解算后的临时输出,待进行限幅
+static volatile bool spin_gyro_wait = false; // 小陀螺起转等待:0°→±85°阶段扣住四个3508,放闸后不再扣
+static volatile bool prev_spin_cmd = false;   // 上一周期是否纯自旋指令,用于等待的沿触发
 
 /* ------------------------------ 舵向零位与方向 ------------------------------ */
 /*
@@ -116,26 +130,25 @@ static float vt_lf, vt_rf, vt_lb, vt_rb,angle_lb,angle_rf;                  // �
  * 机械装配或编码器更换后必须重新标定.
  * 舵向方向:模块反装时几何角与电机转向相反,把对应 DIR 宏置 -1.0f(装反就改这里).
  */
-#define STEER_LB_ZERO_OFFSET 0.0f // 摆正后 angle_single_round 实测值,单位:度(0~360),待标定
-#define STEER_RF_ZERO_OFFSET 0.0f // 摆正后 angle_single_round 实测值,单位:度(0~360),待标定
-#define STEER_LB_DIR 1.0f          // 舵向几何角与电机转向同向:+1,反向:-1
-#define STEER_RF_DIR (-1.0f)       // 与原 steer_rf 配置的 MOTOR_DIRECTION_REVERSE 对应
-static float steer_lb_zero_offset, steer_rf_zero_offset;
+#define STEER_FRONT_ZERO_OFFSET 25.53f 
+#define STEER_BACK_ZERO_OFFSET 143.17f  
+#define STEER_FRONT_DIR 1.0f         // 舵向几何角与电机转向同向:+1,反向:-1
+#define STEER_BACK_DIR 1.0f      // 沿用原 steer_rf 模块安装方向,待装机确认
+static float steer_front_zero_offset, steer_back_zero_offset;
 
 void ChassisInit()
 {
-    //注释的这部分是之前四个电机公用一套PID的初始化，但目前是底盘四个电机分四套PID（目前底盘电机性能不一样）
-    // // 四个轮子的参数一样,改tx_id和反转标志位即可
+
     Motor_Init_Config_s chassis_motor_config = {
         .can_init_config.can_handle = &hcan1,
         .controller_param_init_config = {
             .speed_PID = {
-                .Kp = 17, // 17
-                .Ki = 3.5,   // 3.5
+                .Kp = 2, // 17
+                .Ki = 1,   // 3.5
                 .Kd = 0,   // 0
                 .IntegralLimit = 5000,
                 .Improve = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement,
-                .MaxOut = 10000,
+                .MaxOut = 16384, // 取消功率限制:速度环输出直接就是电流值,放开到M3508满量程(原10000≈61%)
                 .Output_LPF_RC = 0.3,
             },
         },
@@ -147,24 +160,53 @@ void ChassisInit()
         },
         .motor_type = M3508,
     };
-    //  @todo: 当前还没有设置电机的正反转,仍然需要手动添加reference的正负号,需要电机module的支持,待修改.
-    // 旧版 PowerControlInit() 模块在当前库中不存在,功率限制由 LimitChassisOutput() 动态限幅实现
+    // 前后左右布局的ID:前=1 后=2 左=3 右=4,与电机拨码一致(拨码改了这里也要改)
+    // 直走(vx>0)时两个全向轮(左lf/右rf)速度反馈为正,反转标志由该约定推出
     chassis_motor_config.can_init_config.tx_id = 3;
-    chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
-    motor_lf = DJIMotorInit(&chassis_motor_config);
+    chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL; // 左,全向轮:vt_left=-vx,反转后直走为正
+    motor_left = DJIMotorInit(&chassis_motor_config);
 
-    chassis_motor_config.can_init_config.tx_id = 2;
-    chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
-    motor_lb = DJIMotorInit(&chassis_motor_config);
-
-    chassis_motor_config.can_init_config.tx_id = 1;
-    // 直走(vx>0)时两个全向轮(lf/rb)速度反馈为正:vt_rb=+vx,故rb不反转
-    chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
-    motor_rb = DJIMotorInit(&chassis_motor_config);
 
     chassis_motor_config.can_init_config.tx_id = 4;
-    chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
-    motor_rf = DJIMotorInit(&chassis_motor_config);
+    chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE; // 右,全向轮:vt_right=-vx,反转后直走为正
+    motor_right = DJIMotorInit(&chassis_motor_config);
+
+        Motor_Init_Config_s chassis_steermotor_config = {
+        .can_init_config.can_handle = &hcan1,
+        .controller_param_init_config = {
+            .speed_PID = {
+                .Kp = 1.2, // 17
+                .Ki = 0.5,   // 3.5
+                .Kd = 0,   // 0
+                .IntegralLimit = 5000,
+                .Improve = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement,
+                .MaxOut = 16384, // 取消功率限制:速度环输出直接就是电流值,放开到M3508满量程(原10000≈61%)
+                .Output_LPF_RC = 0.3,
+            },
+        },
+        .controller_setting_init_config = {
+            .angle_feedback_source = MOTOR_FEED,
+            .speed_feedback_source = MOTOR_FEED,
+            .outer_loop_type = SPEED_LOOP, // 设置为开环，电机设定值由下面的功率控制设定，不走普通的pid
+            .close_loop_type = SPEED_LOOP,
+        },
+        .motor_type = M3508,
+    };
+
+    // 前/后舵向驱动轮共用一套PID,只改tx_id和反转标志(PIDInit在初始化时拷贝参数,复用结构体安全)
+    chassis_steermotor_config.can_init_config.tx_id = 1;
+    chassis_steermotor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL; // 前,直走为正
+    motor_front = DJIMotorInit(&chassis_steermotor_config);
+
+    chassis_steermotor_config.can_init_config.tx_id = 2;
+    chassis_steermotor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL; // 后,直走为正
+    motor_back = DJIMotorInit(&chassis_steermotor_config);
+
+    // 功率限制用的电机指针表(顺序:前后左右),之前只声明未赋值,会空指针
+    chassis_motor_instance[0] = motor_front;
+    chassis_motor_instance[1] = motor_back;
+    chassis_motor_instance[2] = motor_left;
+    chassis_motor_instance[3] = motor_right;
 
 
 
@@ -172,8 +214,8 @@ void ChassisInit()
         .can_init_config.can_handle = &hcan2,
         .controller_param_init_config = {
             .speed_PID = {
-                .Kp = 16, // 17
-                .Ki = 4,   // 3.5
+                .Kp = 30, // 17
+                .Ki = 50,   // 3.5
                 .Kd = 0,   // 0
                 .IntegralLimit = 5000,
                 .Improve = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement,
@@ -181,9 +223,9 @@ void ChassisInit()
                 .Output_LPF_RC = 0.3,
             },
             .angle_PID = {
-                .Kp = 60,//20, // 8
-                .Ki = 5,
-                .Kd = 3,
+                .Kp = 35,//20, // 8
+                .Ki = 60,
+                .Kd = 0,
                 .DeadBand = 0.1, //死区
                 .Improve = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement,
                 .IntegralLimit = 5,
@@ -202,18 +244,15 @@ void ChassisInit()
 
 
 
-    //  @todo: 当前还没有设置电机的正反转,仍然需要手动添加reference的正负号,需要电机module的支持,待修改.
-    //使用功率控制的电机需要使用PowerControlInit()函数初始化,因为电机的控制方式不同
-
-    chassis_motor_config_steer.can_init_config.tx_id = 1;
+    // 前后舵向GM6020:方向统一在应用层用 STEER_*_DIR 处理,
+    // 角度环的 REVERSE 会镜像设定值,与"以当前角为基准生成设定值"的舵向控制不兼容
+    chassis_motor_config_steer.can_init_config.tx_id = 1; // 前舵向
     chassis_motor_config_steer.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
-    steer_lb = DJIMotorInit(&chassis_motor_config_steer);
+    steer_front = DJIMotorInit(&chassis_motor_config_steer);
 
-    chassis_motor_config_steer.can_init_config.tx_id = 2;
-    // 方向统一在应用层用 STEER_RF_DIR 处理:角度环的 REVERSE 会镜像设定值,
-    // 与"以当前角为基准生成设定值"的舵向控制不兼容
+    chassis_motor_config_steer.can_init_config.tx_id = 2; // 后舵向
     chassis_motor_config_steer.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
-    steer_rf = DJIMotorInit(&chassis_motor_config_steer);
+    steer_back = DJIMotorInit(&chassis_motor_config_steer);
     
 
 
@@ -231,8 +270,8 @@ void ChassisInit()
     PIDInit(&buffer_PID, &Buffer_pid_conf); // 缓冲能量PID初始化
 
     PID_Init_Config_s chassis_follow_pid_conf = {
-        .Kp = 15.0f,
-        .Ki = 5.0f,
+        .Kp = 0.0f,
+        .Ki = 0.0f,
         .Kd = 0.0f,
         .DeadBand = 1.0f,
         .IntegralLimit = 5000,
@@ -274,16 +313,17 @@ void ChassisInit()
 #endif // ONE_BOARD
 }
 
-#define RF_CENTER ((HALF_TRACK_WIDTH - CENTER_GIMBAL_OFFSET_X + HALF_WHEEL_BASE - CENTER_GIMBAL_OFFSET_Y) * DEGREE_2_RAD)
-#define LB_CENTER ((HALF_TRACK_WIDTH + CENTER_GIMBAL_OFFSET_X + HALF_WHEEL_BASE + CENTER_GIMBAL_OFFSET_Y) * DEGREE_2_RAD)
-#define RB_CENTER ((HALF_TRACK_WIDTH - CENTER_GIMBAL_OFFSET_X + HALF_WHEEL_BASE + CENTER_GIMBAL_OFFSET_Y) * DEGREE_2_RAD)
-#define LF_CENTER ((HALF_TRACK_WIDTH + CENTER_GIMBAL_OFFSET_X + HALF_WHEEL_BASE - CENTER_GIMBAL_OFFSET_Y) * DEGREE_2_RAD)
+/* 前后左右布局:轮组位于四边中点(x=前后,前正;y=左右,右正),wz项力臂只取单边坐标 */
+#define FRONT_CENTER ((HALF_WHEEL_BASE - CENTER_GIMBAL_OFFSET_Y) * DEGREE_2_RAD)   // 前(舵向)
+#define BACK_CENTER ((HALF_WHEEL_BASE + CENTER_GIMBAL_OFFSET_Y) * DEGREE_2_RAD)    // 后(舵向)
+#define LEFT_CENTER ((HALF_TRACK_WIDTH + CENTER_GIMBAL_OFFSET_X) * DEGREE_2_RAD)   // 左(全向)
+#define RIGHT_CENTER ((HALF_TRACK_WIDTH - CENTER_GIMBAL_OFFSET_X) * DEGREE_2_RAD)  // 右(全向)
 
 /* 舵向轮组在底盘系下的位置(与上方*_CENTER宏同源,单位mm):x=前后(前正),y=左右(右正) */
-#define STEER_LB_X (-(HALF_WHEEL_BASE + CENTER_GIMBAL_OFFSET_Y))
-#define STEER_LB_Y (-(HALF_TRACK_WIDTH + CENTER_GIMBAL_OFFSET_X))
-#define STEER_RF_X (HALF_WHEEL_BASE - CENTER_GIMBAL_OFFSET_Y)
-#define STEER_RF_Y (HALF_TRACK_WIDTH - CENTER_GIMBAL_OFFSET_X)
+#define STEER_FRONT_X (HALF_WHEEL_BASE - CENTER_GIMBAL_OFFSET_Y)
+#define STEER_FRONT_Y 0
+#define STEER_BACK_X (-(HALF_WHEEL_BASE + CENTER_GIMBAL_OFFSET_Y))
+#define STEER_BACK_Y 0
 
 /**
  * @brief 计算每个轮毂电机的输出,正运动学解算
@@ -291,62 +331,120 @@ void ChassisInit()
  */
 static void MecanumCalculate()
 {
-    vt_lf = -chassis_vx - chassis_vy - chassis_cmd_recv.wz * LF_CENTER;
-    vt_rf = -chassis_vx + chassis_vy + chassis_cmd_recv.wz * RF_CENTER;
-    vt_lb = chassis_vx - chassis_vy + chassis_cmd_recv.wz * LB_CENTER;
-    vt_rb = chassis_vx + chassis_vy - chassis_cmd_recv.wz * RB_CENTER;
+    if (chassis_cmd_recv.chassis_mode == CHASSIS_FREE_MODE)
+    { // 自由模式:舵向锁回正(前进方向),驱动轮直给vx,左右全向轮保持解算
+        angle_front = 0.0f;
+        angle_back = 0.0f;
+        vt_front = chassis_vx;
+        vt_back = chassis_vx;
+        vt_left = -chassis_vx - chassis_cmd_recv.wz * LEFT_CENTER;
+        vt_right = -chassis_vx + chassis_cmd_recv.wz * RIGHT_CENTER;
+        spin_gyro_wait = false;
+        prev_spin_cmd = false;
+        return;
+    }
+
+    // 左/右全向轮:轴线沿左右方向,只出力于vx与wz;横向vy由滚轮自由滑动,轮体不转
+    vt_left = -chassis_vx - chassis_cmd_recv.wz * LEFT_CENTER;   // 左,全向
+    vt_right = -chassis_vx + chassis_cmd_recv.wz * RIGHT_CENTER;  // 右,全向
+    // 前/后舵向驱动:速度取轮位合速度的模(纯vy时前后同向同速),就近原则翻转在SteerModuleSetRef内处理
+    vt_front = sqrtf(chassis_vx * chassis_vx +
+                  (chassis_vy + chassis_cmd_recv.wz * FRONT_CENTER) * (chassis_vy + chassis_cmd_recv.wz * FRONT_CENTER)); // 前,舵向驱动
+    vt_back = sqrtf(chassis_vx * chassis_vx +
+                  (chassis_vy - chassis_cmd_recv.wz * BACK_CENTER) * (chassis_vy - chassis_cmd_recv.wz * BACK_CENTER));   // 后,舵向驱动
 
     // 舵向目标角 = 轮子处实际速度方向(平移 + 自转切向分量ω×r),纯平移(wz=0)时退化为 atan2(vy,vx)
     // 距离乘 DEGREE_2_RAD,与上方 vt_* 中 wz*CENTER 项保持同一缩放;wz 逆时针为正
-    angle_lb = atan2(chassis_vy + chassis_cmd_recv.wz * STEER_LB_X * DEGREE_2_RAD,
-                     chassis_vx - chassis_cmd_recv.wz * STEER_LB_Y * DEGREE_2_RAD) * 57.2958f;
-    angle_rf = atan2(chassis_vy + chassis_cmd_recv.wz * STEER_RF_X * DEGREE_2_RAD,
-                     chassis_vx - chassis_cmd_recv.wz * STEER_RF_Y * DEGREE_2_RAD) * 57.2958f;
+    angle_front = atan2(chassis_vy + chassis_cmd_recv.wz * STEER_FRONT_X * DEGREE_2_RAD,
+                        chassis_vx - chassis_cmd_recv.wz * STEER_FRONT_Y * DEGREE_2_RAD) * 57.2958f;
+    angle_back = atan2(chassis_vy + chassis_cmd_recv.wz * STEER_BACK_X * DEGREE_2_RAD,
+                       chassis_vx - chassis_cmd_recv.wz * STEER_BACK_Y * DEGREE_2_RAD) * 57.2958f;
+
+    // 小陀螺(纯自旋,舵轮目标切线方向±90°):只在刚进入自旋、舵轮从0°起步往±90°转这一阶段扣住四个3508。
+    // 沿触发+锁存:两个舵轮都转到85°以上放闸,本次自旋期间不再扣(舵轮在90°附近抖动不会反复切速度);
+    // 退出纯自旋(切模式或推摇杆)后清零,下次进入时舵轮已松杆回正到0°,再触发一轮等待
+    bool spin_cmd = (chassis_cmd_recv.chassis_mode == CHASSIS_ROTATE &&
+                     fabsf(angle_front) >= SPIN_GYRO_READY_ANGLE && fabsf(angle_back) >= SPIN_GYRO_READY_ANGLE);
+    if (spin_cmd)
+    {
+        float geo_front = wrap_180(STEER_FRONT_DIR * (steer_front->measure.angle_single_round - STEER_FRONT_ZERO_OFFSET));
+        float geo_back  = wrap_180(STEER_BACK_DIR  * (steer_back->measure.angle_single_round  - STEER_BACK_ZERO_OFFSET));
+        if (!prev_spin_cmd && !spin_gyro_wait &&
+            (fabsf(geo_front) < SPIN_GYRO_READY_ANGLE || fabsf(geo_back) < SPIN_GYRO_READY_ANGLE))
+            spin_gyro_wait = true; // 刚进入自旋且舵轮未到位:开始等待
+        if (spin_gyro_wait)
+        {
+            if (fabsf(geo_front) >= SPIN_GYRO_READY_ANGLE && fabsf(geo_back) >= SPIN_GYRO_READY_ANGLE)
+                spin_gyro_wait = false; // 前/后舵轮都到位,放闸
+            else
+                vt_left = vt_right = vt_front = vt_back = 0.0f; // 等舵轮到位,四个3508都不动
+        }
+    }
+    else
+    {
+        spin_gyro_wait = false;
+    }
+    prev_spin_cmd = spin_cmd;
 }
 
 
+/* 台架调试:未接裁判系统(referee_data为NULL)时的手动功率上限(W);
+   比赛接上裁判系统后走裁判系统下发值,此宏不再生效 */
+#define CHASSIS_POWER_LIMIT_MANUAL 50.0f
+
 /**
- * @brief 对功率进行缩放，参考西交利物浦的方案（但目前并不是使用西交利物浦的方案进行功率限制）
+ * @brief 对功率进行缩放,参考西交利物浦的方案:估算四个驱动轮总功率,
+ *        超限时按比例压缩各轮功率并反解电流上限写入speed_PID.MaxOut(逐轮限流)
  *
  */
 static void LimitChassisOutput()
 {
     chassis_pid_totaloutput = 0;
-    chassis_power_limit = referee_data->GameRobotState.chassis_power_limit; // 从裁判系统获取的能量限制
-
-    chassis_input_power = referee_data->PowerHeatData.chassis_power;
-    chassis_power_buffer = referee_data->PowerHeatData.chassis_power_buffer;
-
-    // if (chassis_power_limit >= 100)
-    // {
-    //     chassis_power_limit = 100;
-    // }
-
-  //  chassis_power_limit=50;
-
-    // 根据缓冲能量和当前功率限制，计算最大功率值
-    chassis_power_offset = -1 * CHASSIS_POWER_COFFICIENT * (chassis_power_limit)-0;
-
-    chassis_power_max = chassis_power_limit + chassis_power_offset;
-
-
-
-    if (isLowBuffer)
+    // 估算四个驱动轮(M3508,不含舵向GM6020)的当前功率并累加,功率模型
+    // P = k1·I² + k2·n² + toque_coefficient·n·I + constant(I=速度环输出=电流指令,n=转速aps),
+    // 与下方反解电流的一元二次方程系数(a=k1, b=toque_coefficient·n, c=k2·n²-P+constant)保持一致
+    for (int i = 0; i < 4; i++)
     {
-        chassis_power_max = chassis_power_max - 25;
-        if (chassis_power_buffer >= 55.0f)
+        float current_out = chassis_motor_instance[i]->motor_controller.speed_PID.Output;
+        float speed_aps = chassis_motor_instance[i]->measure.speed_aps;
+        chassis_pid_output[i] = k1 * float_Square(current_out) + k2 * float_Square(speed_aps) +
+                                toque_coefficient * speed_aps * current_out + constant_coefficient;
+        if (chassis_pid_output[i] < 0)
+            continue; // 负功率=电机发电/制动,不计入消耗
+        chassis_pid_totaloutput += chassis_pid_output[i];
+    }
+    if (referee_data)
+    { // 已接裁判系统:功率上限取裁判系统下发值,并按缓冲能量做迟滞调节
+        chassis_power_limit = referee_data->GameRobotState.chassis_power_limit; // 从裁判系统获取的能量限制
+        chassis_input_power = referee_data->PowerHeatData.chassis_power;
+        chassis_power_buffer = referee_data->PowerHeatData.chassis_power_buffer;
+
+        // 根据缓冲能量和当前功率限制，计算最大功率值
+        chassis_power_offset = -1 * CHASSIS_POWER_COFFICIENT * (chassis_power_limit)-0;
+        chassis_power_max = chassis_power_limit + chassis_power_offset;
+
+        if (isLowBuffer)
         {
-            isLowBuffer = false;
+            chassis_power_max = chassis_power_max - 25;
+            if (chassis_power_buffer >= 55.0f)
+            {
+                isLowBuffer = false;
+            }
+        }
+        else
+        {
+            // 缓冲能量判断，如果缓冲能量少，则马上减小功率，减少量待测
+            if (chassis_power_buffer < 10.0f)
+            {
+                isLowBuffer = true;
+                chassis_power_max = chassis_power_max - 35;
+            }
         }
     }
     else
-    {
-        // 缓冲能量判断，如果缓冲能量少，则马上减小功率，减少量待测
-        if (chassis_power_buffer < 10.0f)
-        {
-            isLowBuffer = true;
-            chassis_power_max = chassis_power_max - 35;
-        }
+    { // 未接裁判系统(台架):用手动功率上限直接限功率
+        chassis_power_limit = CHASSIS_POWER_LIMIT_MANUAL;
+        chassis_power_max = CHASSIS_POWER_LIMIT_MANUAL;
     }
 
   
@@ -383,8 +481,10 @@ static void LimitChassisOutput()
     }
     else
     {
+        // 未超功率:恢复满量程电流上限(16384)。注意不能写成 MaxOut=|Output|,
+        // 否则上限会被每周期锁死在当前输出,电机之后再也无法加大电流
         for (int i = 0; i < 4; i++)
-            chassis_motor_instance[i]->motor_controller.speed_PID.MaxOut = fabsf(chassis_motor_instance[i]->motor_controller.speed_PID.Output);
+            chassis_motor_instance[i]->motor_controller.speed_PID.MaxOut = 16384.0f;
     }
 }
 
@@ -407,6 +507,12 @@ static void LimitChassisOutput()
 static void SteerModuleSetRef(DJIMotorInstance *steer, DJIMotorInstance *drive,
                               float zero_offset, float dir, float target_geo, float drive_speed)
 {
+    if (drive_speed == 0.0f && !spin_gyro_wait)
+    { // 松摇杆回正:无指令时目标几何角置0,就近原则自动走最短路径回前进方向;
+      // 小陀螺等待舵轮到位期间(spin_gyro_wait)保持切线目标角,不回收,否则永远转不到85°
+        target_geo = 0.0f;
+    }
+
     // 当前几何角 = 安装方向修正 × (单圈编码器角 - 零位常量),折返到[-180,180)
     float cur_geo = wrap_180(dir * (steer->measure.angle_single_round - zero_offset));
     float err = wrap_180(target_geo - cur_geo);
@@ -439,12 +545,12 @@ static void SteerModuleSetRef(DJIMotorInstance *steer, DJIMotorInstance *drive,
  */
 static void ChassisSetRef()
 {
-    DJIMotorSetRef(motor_lf, vt_lf);
-    DJIMotorSetRef(motor_rf, vt_rf);
-    DJIMotorSetRef(motor_lb, vt_lb);
-    DJIMotorSetRef(motor_rb, vt_rb);
-    SteerModuleSetRef(steer_lb, motor_lb, steer_lb_zero_offset, STEER_LB_DIR, angle_lb, vt_lb);
-    SteerModuleSetRef(steer_rf, motor_rf, steer_rf_zero_offset, STEER_RF_DIR, angle_rf, vt_rf);
+    DJIMotorSetRef(motor_left, vt_left);
+    DJIMotorSetRef(motor_right, vt_right);
+    // 舵轮驱动速度按半径比换算(舵轮60mm < 全向轮70mm)。注意必须乘在传给SteerModuleSetRef的
+    // drive_speed上:drive电机的ref最终由它内部DJIMotorSetRef(drive, ...)设置,外层直接SetRef会被覆盖
+    SteerModuleSetRef(steer_front, motor_front, steer_front_zero_offset, STEER_FRONT_DIR, angle_front, vt_front * STEER_DRIVE_SPEED_RATIO);
+    SteerModuleSetRef(steer_back, motor_back, steer_back_zero_offset, STEER_BACK_DIR, angle_back, vt_back * STEER_DRIVE_SPEED_RATIO);
 }
 
 /**
@@ -475,21 +581,21 @@ void ChassisTask()
     SetPowerLimit(99999);//设置功率限制（自己实际设定）—— 新版库无此函数,功率限制由 LimitChassisOutput() 实现
     if (chassis_cmd_recv.chassis_mode == CHASSIS_ZERO_FORCE)
     { // 如果出现重要模块离线或遥控器设置为急停,让电机停止（电流为0）
-        DJIMotorStop(motor_lf);
-        DJIMotorStop(motor_rf);
-        DJIMotorStop(motor_lb);
-        DJIMotorStop(motor_rb);
-        DJIMotorStop(steer_lb);
-        DJIMotorStop(steer_rf);
+        DJIMotorStop(motor_left);
+        DJIMotorStop(motor_right);
+        DJIMotorStop(motor_front);
+        DJIMotorStop(motor_back);
+        DJIMotorStop(steer_front);
+        DJIMotorStop(steer_back);
     }
     else
     { // 正常工作
-        DJIMotorEnable(motor_lf);
-        DJIMotorEnable(motor_rf);
-        DJIMotorEnable(motor_lb);
-        DJIMotorEnable(motor_rb);
-        DJIMotorEnable(steer_lb);
-        DJIMotorEnable(steer_rf);
+        DJIMotorEnable(motor_left);
+        DJIMotorEnable(motor_right);
+        DJIMotorEnable(motor_front);
+        DJIMotorEnable(motor_back);
+        DJIMotorEnable(steer_front);
+        DJIMotorEnable(steer_back);
     }
 
 
@@ -509,17 +615,19 @@ void ChassisTask()
     switch (chassis_cmd_recv.chassis_mode)
     {
     case CHASSIS_NO_FOLLOW: // 底盘不旋转,但维持全向机动,一般用于调整云台姿态
-        chassis_cmd_recv.wz = 0;
         break;
     case CHASSIS_FOLLOW_GIMBAL_YAW: // 跟随云台,以offset_angle为误差的PID输出为转速
         chassis_cmd_recv.wz = PIDCalculate(&chassis_follow_PID, chassis_cmd_recv.offset_angle, 0.0f);
         break;
     case CHASSIS_ROTATE: // 自旋,同时保持全向机动;当前wz维持定值,后续增加不规则的变速策略
-        chassis_cmd_recv.wz = 400;
+        chassis_cmd_recv.wz = 1500;
         break;
     default: // FREE_MODE 摇杆直通,DEBUG_MODE 用 debug_data,wz 由 cmd 层直接给出
         break;
     }
+
+    // 台架临时:云台未对齐/未接时offset_angle把vx/vy混叠,强制为0;装机比赛前删掉本行恢复云台系旋转
+    chassis_cmd_recv.offset_angle = 0;
 
     // 根据云台和底盘的角度offset将控制量映射到底盘坐标系上
     // 底盘逆时针旋转为角度正方向;云台命令的方向以云台指向的方向为x,采用右手系(x指向正北时y在正东)
@@ -534,14 +642,18 @@ void ChassisTask()
     MecanumCalculate();
 
     // 舵向零位:固定机械偏移常量(见文件顶部宏),与上电姿态无关
-    steer_lb_zero_offset = STEER_LB_ZERO_OFFSET;
-    steer_rf_zero_offset = STEER_RF_ZERO_OFFSET;
+    steer_front_zero_offset = STEER_FRONT_ZERO_OFFSET;
+    steer_back_zero_offset = STEER_BACK_ZERO_OFFSET;
+    angle_target_front = steer_front_zero_offset + STEER_FRONT_DIR * angle_front; // 前舵向目标单圈角 = 零位 + DIR×几何目标角
+    angle_target_back  = steer_back_zero_offset  + STEER_BACK_DIR  * angle_back;  // 后舵向目标单圈角(注意 DIR=-1,与几何角反号)
 
     // 设定底盘闭环参考值
     ChassisSetRef();
+    steer_front_angle_ref = steer_front->motor_controller.pid_ref; // 前舵向角度环设定值(目标多圈角,度)
+    steer_back_angle_ref  = steer_back->motor_controller.pid_ref;  // 后舵向角度环设定值(目标多圈角,度)
 
     // 根据裁判系统的反馈数据和电容数据对输出限幅并设定闭环参考值
-   LimitChassisOutput();
+    LimitChassisOutput();
 
 
     // // 获取裁判系统数据   建议将裁判系统与底盘分离，所以此处数据应使用消息中心发送
@@ -551,8 +663,10 @@ void ChassisTask()
     // chassis_feedback_data.bullet_speed = referee_data->GameRobotState.shooter_id1_17mm_speed_limit;
     // chassis_feedback_data.rest_heat = referee_data->PowerHeatData.shooter_heat0;
 
-    chassis_lb_v = motor_lb->measure.speed_aps/6.0;
-    chassis_rb_v = motor_rb->measure.speed_aps/6.0;
+    chassis_lb_v = motor_front->measure.speed_aps/6.0; // 前舵向驱动
+    chassis_rb_v = motor_back->measure.speed_aps/6.0; // 后舵向驱动
+    chassis_lf_v = motor_left->measure.speed_aps/6.0; // 左全向轮
+    chassis_rf_v = motor_right->measure.speed_aps/6.0; // 右全向轮
 
     // 推送反馈消息
 #ifdef ONE_BOARD

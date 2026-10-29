@@ -18,6 +18,7 @@
 // 私有宏,自动将编码器转换成角度值
 #define YAW_ALIGN_ANGLE (YAW_CHASSIS_ALIGN_ECD * ECD_ANGLE_COEF_DJI) // 对齐时的角度,0-360
 #define PTICH_HORIZON_ANGLE (PITCH_HORIZON_ECD * ECD_ANGLE_COEF_DJI) // pitch水平时电机的角度,0-360
+#define AIM_ERROR_MAX 0.8f // 允许开火时云台跟踪误差阈值(°),实车可调
 
 /* cmd应用包含的模块实例指针和交互信息存储*/
 #ifdef GIMBAL_BOARD // 对双板的兼容,条件编译
@@ -55,17 +56,16 @@ static Robot_Status_e robot_state; // 机器人整体工作状态
 
 BMI088Instance *bmi088_test; // 云台IMU
 BMI088_Data_t bmi088_data;
- float yaw_data;  //调速度环用的变量
- float pitch_data;  //调速度环用的变量
+float yaw_data;  //开火门控:yaw跟踪误差(°)
+float pitch_data;  //开火门控:pitch跟踪误差(°)
 extern float vision_yaw_angle;
 extern float vision_pitch_angle;
 
 extern uint8_t loader_is_reversing;
 
 
-static volatile float pitch_vel_data; //调试变量(volatile防止-Og优化掉,可在调试器里实时改值)
-static volatile float yaw_vel_data;
-static volatile float roll_vel_data;  //调试变量(roll轴目标转速,单位dps,纯速度环)
+static float pitch_vel_data;  //调试变量
+static float yaw_vel_data;
 
 // 添加裁判系统UI初始化函数声明
 extern void MyUIInit();
@@ -91,7 +91,7 @@ void RobotCMDInit()
 #ifdef GIMBAL_BOARD
     CANComm_Init_Config_s comm_conf = {
         .can_config = {
-            .can_handle = &hcan2,
+            .can_handle = &hcan1,
             .tx_id = 0x312,
             .rx_id = 0x311,
         },
@@ -137,6 +137,16 @@ static void CalcOffsetAngle()
         chassis_cmd_send.offset_angle -= 360.0f;
 }
 
+/**
+ * @brief 将角度差绕圈到[-180,180],用于计算yaw方向的最小跟踪误差
+ */
+static float WrapDeg180(float angle)
+{
+    while (angle > 180.0f) angle -= 360.0f;
+    while (angle < -180.0f) angle += 360.0f;
+    return angle;
+}
+
 float chassis_speed_rocker=0;//十级10000
 /**
  * @brief 控制输入为遥控器(调试时)的模式和控制量设置
@@ -153,17 +163,17 @@ static void RemoteControlSet()
     {
         // chassis_cmd_send.chassis_mode = CHASSIS_FOLLOW_GIMBAL_YAW;
         // gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
-
+        
         chassis_cmd_send.chassis_mode = CHASSIS_FOLLOW_GIMBAL_YAW;//底盘云台分离
         gimbal_cmd_send.gimbal_mode = GIMBAL_FREE_MODE;
 
 
     }
     else if (switch_is_down(rc_data[TEMP].rc.switch_left) && switch_is_mid(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[中],底盘和云台分离,底盘保持不转动
-    {
+    {   
         chassis_cmd_send.chassis_mode = CHASSIS_ROTATE;
         gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
-
+        
     }
     else if (switch_is_down(rc_data[TEMP].rc.switch_left) && switch_is_up(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[上],底盘和云台分离,底盘使用IMU数据
     {
@@ -183,6 +193,8 @@ static void RemoteControlSet()
         // gimbal_cmd_send.yaw -= vision_recv_data->yaw*RAD_2_DEGREE+0.001f * (float)rc_data[TEMP].rc.rocker_l_;
         // gimbal_cmd_send.pitch +=vision_recv_data->pitch*RD_2_DEGREE;
         //自瞄控制变量
+        // yaw:VisionTrajectory中已unwrap为连续累计角(°),与角度环反馈YawTotalAngle同坐标系,直接赋值
+        // gimbal_cmd_send.yaw=(vision_recv_data->yaw)*0.6+0.001f * (float)rc_data[TEMP].rc.rocker_l_;
         gimbal_cmd_send.yaw=(vision_recv_data->yaw*RAD_2_DEGREE-5)*0.6+gimbal_cmd_send.yaw_vel*20+0.001f * (float)rc_data[TEMP].rc.rocker_l_;
         gimbal_cmd_send.pitch=(vision_recv_data->pitch*RAD_2_DEGREE)*0.5+gimbal_cmd_send.pitch_vel*0.1+0.0015f * (float)rc_data[TEMP].rc.rocker_l1;
         //vision_l_yaw_tar = yaw_l_motor->measure.total_angle + gimbal_cmd_recv.yaw*RAD_2_DEGREE*0.3 + gimbal_cmd_recv.yaw_vel*15*(-1);
@@ -192,7 +204,7 @@ static void RemoteControlSet()
     { // 按照摇杆的输出大小进行角度增量,增益系数需调整
         gimbal_cmd_send.yaw += -0.003f * (float)rc_data[TEMP].rc.rocker_l_;//左水平拨杆,控制yaw角度
         gimbal_cmd_send.pitch += -0.0015f * (float)rc_data[TEMP].rc.rocker_l1;//左竖直拨杆,控制pitch角度
-
+    
     }
      //云台软件限位（pitch）
     if(gimbal_cmd_send.pitch>=PITCH_MAX_ANGLE)
@@ -219,33 +231,28 @@ static void RemoteControlSet()
     else if(switch_is_mid(rc_data[TEMP].rc.switch_left) && switch_is_up(rc_data[TEMP].rc.switch_right))//左开关中，右开关上（摩擦轮开，拨弹开）
     {
         shoot_cmd_send.friction_mode = FRICTION_ON;
-        shoot_cmd_send.load_mode=LOAD_1_BULLET;
+        shoot_cmd_send.shoot_mode = SHOOT_ON;
         //shoot_cmd_send.load_mode=LOAD_stovepipe;//卡弹反拨
 
-        // yaw_data=fabsf(gimbal_cmd_send.yaw - gimbal_fetch_data.gimbal_imu_data.Yaw);
-        // pitch_data=fabsf(gimbal_cmd_send.pitch - gimbal_fetch_data.gimbal_imu_data.Pitch);
-        // if( yaw_data < 0.8 &&  pitch_data < 0.8)    //当pitch和yaw角度都在0.8以下时,才开启发射
+        // 视觉开火门控:仅当视觉判定就绪(READY_TO_FIRE)且云台跟踪误差足够小时才允许拨弹
+        // 视觉丢失/未就绪/误差过大时停拨弹,摩擦轮保持运转以便随时开火
+        yaw_data = fabsf(WrapDeg180(gimbal_cmd_send.yaw - gimbal_fetch_data.gimbal_imu_data.Yaw));
+        pitch_data = fabsf(gimbal_cmd_send.pitch - gimbal_fetch_data.gimbal_imu_data.Pitch);
+        // if (vision_recv_data->mode == READY_TO_FIRE && yaw_data < AIM_ERROR_MAX && pitch_data < AIM_ERROR_MAX)
         // {
-        //   if(loader_is_reversing==1 )
-        //   {
-        //   shoot_cmd_send.load_mode=LOAD_stovepipe;
-        //   }
-        //   else
-        //   {
-        //   shoot_cmd_send.load_mode=LOAD_BURSTFIRE;
-        //   }
-        //}
+            shoot_cmd_send.load_mode = LOAD_BURSTFIRE;
+        // }
         // else
         // {
-        //     shoot_cmd_send.load_mode=LOAD_STOP;
+        //     shoot_cmd_send.load_mode = LOAD_STOP;
         // }
-        shoot_cmd_send.shoot_mode = SHOOT_ON;
     }
-
+    
 
     // 底盘参数,目前没有加入小陀螺(调试似乎暂时没有必要),系数需要调整
-    chassis_cmd_send.vx = 15.0f * (float)(rc_data[TEMP].rc.rocker_r_-12); // _水平方向（-11是为了补偿遥控器波杆偏移）  //-11   //*-20
-    chassis_cmd_send.vy = 15.0f * (float)rc_data[TEMP].rc.rocker_r1; // 竖直方向
+    chassis_cmd_send.vx = 15.0f * (float)(rc_data[TEMP].rc.rocker_r1); // _水平方向（-11是为了补偿遥控器波杆偏移）  //-11   //*-20
+    chassis_cmd_send.vy = 15.0f * (float)rc_data[TEMP].rc.rocker_r_; // 竖直方向
+    chassis_cmd_send.wz = 15.0f * (float)rc_data[TEMP].rc.rocker_l_; // 陀螺角度
 
     shoot_cmd_send.shoot_rate = 8;  //每秒多少发
 }
@@ -283,12 +290,12 @@ static void MouseKeySet()
         // {
 
         // if (rc_data[TEMP].key_count[KEY_PRESS][Key_G] % 2 == 1)
-        //  {
+        //  { 
         //     if(loader_is_reversing==1 )
         //   {
         //   shoot_cmd_send.load_mode=LOAD_stovepipe;
         //   }
-        //   else
+        //   else 
         //   {
         //   shoot_cmd_send.load_mode=LOAD_BURSTFIRE;
         //   }
@@ -345,7 +352,7 @@ static void MouseKeySet()
           {
           shoot_cmd_send.load_mode=LOAD_stovepipe;
           }
-          else
+          else 
           {
           shoot_cmd_send.load_mode=LOAD_BURSTFIRE;
           }
@@ -462,13 +469,9 @@ void RobotCMDTask()
         RemoteControlSet();
      else if (switch_is_up(rc_data[TEMP].rc.switch_left)) // 遥控器左侧开关状态为[上],键盘控制    1
         RemoteControlSet();
-        //  MouseKeySet();
     EmergencyHandler(); // 处理模块离线和遥控器急停等紧急情况
 
-    // roll轴转速为调试变量,直接给定,不参与遥控器/键鼠逻辑
-    gimbal_cmd_send.roll_vel = roll_vel_data;
-
-    //自瞄
+    //自瞄 
     //VisionRadaControlSet();
 
 
