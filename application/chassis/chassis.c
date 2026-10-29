@@ -118,8 +118,8 @@ static float wrap_180(float x)
 /* 私有函数计算的中介变量,设为静态避免参数传递的开销 */
 static float chassis_vx, chassis_vy;                      // 将云台系的速度投影到底盘
 static float vt_front, vt_back, vt_left, vt_right, angle_front, angle_back;           // 底盘速度解算后的临时输出,待进行限幅
-static volatile bool spin_gyro_wait = false; // 小陀螺起转等待:0°→±85°阶段扣住四个3508,放闸后不再扣
-static volatile bool prev_spin_cmd = false;   // 上一周期是否纯自旋指令,用于等待的沿触发
+static volatile bool spin_gyro_wait = false; // 小陀螺起转等待:切进小陀螺且舵轮未到85°时扣住四个3508,放闸后不再扣
+static volatile bool prev_rotate_mode = false; // 上一周期是否处于小陀螺模式,模式切换沿触发等待
 
 /* ------------------------------ 舵向零位与方向 ------------------------------ */
 /*
@@ -340,7 +340,7 @@ static void MecanumCalculate()
         vt_left = -chassis_vx - chassis_cmd_recv.wz * LEFT_CENTER;
         vt_right = -chassis_vx + chassis_cmd_recv.wz * RIGHT_CENTER;
         spin_gyro_wait = false;
-        prev_spin_cmd = false;
+        prev_rotate_mode = false;
         return;
     }
 
@@ -360,22 +360,23 @@ static void MecanumCalculate()
     angle_back = atan2(chassis_vy + chassis_cmd_recv.wz * STEER_BACK_X * DEGREE_2_RAD,
                        chassis_vx - chassis_cmd_recv.wz * STEER_BACK_Y * DEGREE_2_RAD) * 57.2958f;
 
-    // 小陀螺(纯自旋,舵轮目标切线方向±90°):只在刚进入自旋、舵轮从0°起步往±90°转这一阶段扣住四个3508。
-    // 沿触发+锁存:两个舵轮都转到85°以上放闸,本次自旋期间不再扣(舵轮在90°附近抖动不会反复切速度);
-    // 退出纯自旋(切模式或推摇杆)后清零,下次进入时舵轮已松杆回正到0°,再触发一轮等待
-    bool spin_cmd = (chassis_cmd_recv.chassis_mode == CHASSIS_ROTATE &&
-                     fabsf(angle_front) >= SPIN_GYRO_READY_ANGLE && fabsf(angle_back) >= SPIN_GYRO_READY_ANGLE);
-    if (spin_cmd)
+    // 小陀螺放闸:切进CHASSIS_ROTATE(模式切换沿)时,若前/后舵轮未转到85°以上,扣住四个3508,
+    // 等两个舵轮实际都到85°(切线方向±90°附近)再给速度,避免起转瞬间轮子横着被拖;
+    // 放闸后本次自旋期间不再扣(舵轮在90°附近抖动/推杆不会反复切速度),退出小陀螺模式后重新武装
+    bool rotate_mode = (chassis_cmd_recv.chassis_mode == CHASSIS_ROTATE);
+    if (rotate_mode)
     {
         float geo_front = wrap_180(STEER_FRONT_DIR * (steer_front->measure.angle_single_round - STEER_FRONT_ZERO_OFFSET));
         float geo_back  = wrap_180(STEER_BACK_DIR  * (steer_back->measure.angle_single_round  - STEER_BACK_ZERO_OFFSET));
-        if (!prev_spin_cmd && !spin_gyro_wait &&
+        if (!prev_rotate_mode && !spin_gyro_wait &&
             (fabsf(geo_front) < SPIN_GYRO_READY_ANGLE || fabsf(geo_back) < SPIN_GYRO_READY_ANGLE))
-            spin_gyro_wait = true; // 刚进入自旋且舵轮未到位:开始等待
+            spin_gyro_wait = true; // 刚切进小陀螺且舵轮未到位:开始等待
         if (spin_gyro_wait)
         {
-            if (fabsf(geo_front) >= SPIN_GYRO_READY_ANGLE && fabsf(geo_back) >= SPIN_GYRO_READY_ANGLE)
-                spin_gyro_wait = false; // 前/后舵轮都到位,放闸
+            // 放闸:舵轮到位;或目标角偏离切线(推杆平移时目标角<85°,舵轮到不了85°,放弃等待防死锁)
+            if ((fabsf(geo_front) >= SPIN_GYRO_READY_ANGLE && fabsf(geo_back) >= SPIN_GYRO_READY_ANGLE) ||
+                fabsf(angle_front) < SPIN_GYRO_READY_ANGLE || fabsf(angle_back) < SPIN_GYRO_READY_ANGLE)
+                spin_gyro_wait = false; // 放闸
             else
                 vt_left = vt_right = vt_front = vt_back = 0.0f; // 等舵轮到位,四个3508都不动
         }
@@ -384,7 +385,7 @@ static void MecanumCalculate()
     {
         spin_gyro_wait = false;
     }
-    prev_spin_cmd = spin_cmd;
+    prev_rotate_mode = rotate_mode;
 }
 
 
