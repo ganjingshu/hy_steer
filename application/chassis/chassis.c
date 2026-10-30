@@ -596,10 +596,6 @@ void ChassisTask()
 #endif // CHASSIS_BOARD
 
 
-    // 获取发射模块数据并更新UI摩擦轮状态
-    // SubGetMessage(shoot_sub, &shoot_cmd_recv);
-    // ui_data.friction_mode = shoot_cmd_recv.friction_mode;
-
     //SetPowerLimit(referee_data->GameRobotState.chassis_power_limit);//设置功率限制（裁判系统）
     SetPowerLimit(99999);//设置功率限制（自己实际设定）—— 新版库无此函数,功率限制由 LimitChassisOutput() 实现
     if (chassis_cmd_recv.chassis_mode == CHASSIS_ZERO_FORCE)
@@ -678,18 +674,24 @@ void ChassisTask()
     // 根据裁判系统的反馈数据和电容数据对输出限幅并设定闭环参考值
     LimitChassisOutput();
 
-    // 超级电容模式:遥控器左上开关[上]为总开关;未开启时静默关闭,开启后按底盘模式和充电/功率条件选择
+    // 超级电容模式:遥控器左上开关[上]为总开关;未开启时静默关闭,开启后按底盘模式与功率条件选择
     WorkMode cap_mode;
     if (!chassis_cmd_recv.super_cap_enable)
     {
         cap_mode = MODE_SILENT; // 左上开关未开启:电容关闭
     }
+    else if (chassis_cmd_recv.chassis_mode == CHASSIS_ZERO_FORCE)
+    {
+        cap_mode = MODE_SILENT; // 底盘零力:电容关闭
+    }
+    else if (chassis_pid_totaloutput <= SUPER_CAP_OFF_CHASSIS_POWER)
+    {
+        // 低负载(≤30W):缓冲能量足够,电容充满则静默关闭,未充满趁机充电
+        cap_mode = (cap->cap_msg.cap_voltage >= SUPER_CAP_FULL_VOLTAGE) ? MODE_SILENT : MODE_CHARGE;
+    }
     else
     {
-        cap_mode = (chassis_cmd_recv.chassis_mode == CHASSIS_ZERO_FORCE) ? MODE_SILENT : MODE_WORK;
-        // 电容充满(≥24V)且底盘功率≤30W:缓冲能量足够带负载,电容无需出力,静默关闭
-        if (cap->cap_msg.cap_voltage >= SUPER_CAP_FULL_VOLTAGE && chassis_pid_totaloutput <= SUPER_CAP_OFF_CHASSIS_POWER)
-            cap_mode = MODE_SILENT;
+        cap_mode = MODE_WORK; // 高负载(>30W):电容输出补功率
     }
     uint8_t chassis_output_enable = (referee_data != NULL) ? referee_data->GameRobotState.mains_power_chassis_output : 1;
     SuperCapControl(cap, (uint8_t)chassis_power_limit, cap_mode, chassis_output_enable);
