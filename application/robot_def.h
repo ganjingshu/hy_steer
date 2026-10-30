@@ -153,6 +153,7 @@ typedef struct
     float offset_angle; // 底盘和归中位置的夹角
     chassis_mode_e chassis_mode;
     int chassis_speed_buff;
+    uint8_t super_cap_enable; // 超级电容使能:1=开启,0=关闭(遥控器左上开关[上]为开启)
 
     float debug_data;   // debug数据，用于各种用途（电流，速度等）
     uint8_t debug_flag; // debug传输标志位，用于传输给其他模块切换不同模式（开启数据输出等）

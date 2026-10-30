@@ -185,6 +185,9 @@ static void RemoteControlSet()
 
     }
 
+    // 超级电容总开关:遥控器左上开关拨到[上]=开启电容,[中]/[下]=关闭
+    chassis_cmd_send.super_cap_enable = switch_is_up(rc_data[TEMP].rc.switch_left) ? 1 : 0;
+
     // 云台参数,确定云台控制数据
     if (switch_is_mid(rc_data[TEMP].rc.switch_left)) // 左侧开关状态为[中],视觉模式，目前给发射做调试使用
     {

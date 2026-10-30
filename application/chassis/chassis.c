@@ -678,10 +678,19 @@ void ChassisTask()
     // 根据裁判系统的反馈数据和电容数据对输出限幅并设定闭环参考值
     LimitChassisOutput();
 
-    WorkMode cap_mode = (chassis_cmd_recv.chassis_mode == CHASSIS_ZERO_FORCE) ? MODE_SILENT : MODE_WORK;
-    // 电容充满(≥24V)且底盘功率≤30W:缓冲能量足够带负载,电容无需出力,静默关闭
-    if (cap->cap_msg.cap_voltage >= SUPER_CAP_FULL_VOLTAGE && chassis_pid_totaloutput <= SUPER_CAP_OFF_CHASSIS_POWER)
-        cap_mode = MODE_SILENT;
+    // 超级电容模式:遥控器左上开关[上]为总开关;未开启时静默关闭,开启后按底盘模式和充电/功率条件选择
+    WorkMode cap_mode;
+    if (!chassis_cmd_recv.super_cap_enable)
+    {
+        cap_mode = MODE_SILENT; // 左上开关未开启:电容关闭
+    }
+    else
+    {
+        cap_mode = (chassis_cmd_recv.chassis_mode == CHASSIS_ZERO_FORCE) ? MODE_SILENT : MODE_WORK;
+        // 电容充满(≥24V)且底盘功率≤30W:缓冲能量足够带负载,电容无需出力,静默关闭
+        if (cap->cap_msg.cap_voltage >= SUPER_CAP_FULL_VOLTAGE && chassis_pid_totaloutput <= SUPER_CAP_OFF_CHASSIS_POWER)
+            cap_mode = MODE_SILENT;
+    }
     uint8_t chassis_output_enable = (referee_data != NULL) ? referee_data->GameRobotState.mains_power_chassis_output : 1;
     SuperCapControl(cap, (uint8_t)chassis_power_limit, cap_mode, chassis_output_enable);
 
