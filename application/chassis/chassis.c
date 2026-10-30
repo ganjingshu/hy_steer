@@ -38,7 +38,7 @@
 /* 小陀螺起转放闸角:刚进入自旋时,前/后舵轮实际几何角都转到该角度以上,四个3508才给速度 */
 #define SPIN_GYRO_READY_ANGLE 85.0f
 /* 电容管理:电容充满(≥24V)且底盘功率≤30W时无需电容出力,静默关闭电容防满电空耗 */
-#define SUPER_CAP_FULL_VOLTAGE 24.0f
+#define SUPER_CAP_FULL_VOLTAGE 23.8f
 #define SUPER_CAP_OFF_CHASSIS_POWER 30.0f
 
 /* 底盘应用包含的模块和信息存储,底盘是单例模式,因此不需要为底盘建立单独的结构体 */
