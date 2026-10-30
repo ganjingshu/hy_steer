@@ -37,6 +37,9 @@
 #define STEER_DRIVE_SPEED_RATIO (RADIUS_OMNI_WHEEL * 1.0f / RADIUS_STEER_WHEEL)
 /* 小陀螺起转放闸角:刚进入自旋时,前/后舵轮实际几何角都转到该角度以上,四个3508才给速度 */
 #define SPIN_GYRO_READY_ANGLE 85.0f
+/* 电容管理:电容充满(≥24V)且底盘功率≤30W时无需电容出力,静默关闭电容防满电空耗 */
+#define SUPER_CAP_FULL_VOLTAGE 24.0f
+#define SUPER_CAP_OFF_CHASSIS_POWER 30.0f
 
 /* 底盘应用包含的模块和信息存储,底盘是单例模式,因此不需要为底盘建立单独的结构体 */
 #ifdef CHASSIS_BOARD // 如果是底盘板,使用板载IMU获取底盘转动角速度
@@ -283,10 +286,20 @@ void ChassisInit()
     SuperCap_Init_Config_s cap_conf = {
         .can_config = {
             .can_handle = &hcan2,
-            .tx_id = 0x302, // 超级电容默认接收id
-            .rx_id = 0x301, // 超级电容默认发送id,注意tx和rx在其他人看来是反的
+            .tx_id = 0x302,
+            .rx_id = 0x301,
         }};
-    cap = SuperCapInit(&cap_conf); // 超级电容初始化
+    SuperCapInit(&cap_conf);           // ① 0x302 初始化帧实例(握手机体)
+
+    cap_conf.can_config.tx_id = 0x303; // 控制帧
+    cap_conf.can_config.rx_id = 0x304; // 反馈帧
+    cap_conf.offline_timeout = 150;    // 100Hz下1.5s = 连丢3帧超时
+    cap_conf.auto_charge_voltage = 6.0f; // 6V以下自动充电,填0关闭
+    cap = SuperCapInit(&cap_conf);     // ② 0x303 控制帧实例(主实例)
+
+    cap_conf.can_config.tx_id = 0x001; // 安全帧(只收)
+    cap_conf.can_config.rx_id = 0x001;
+    SuperCapInit(&cap_conf);           // ③ 0x001 安全帧监听实例
 
     // 发布订阅初始化,如果为双板,则需要can comm来传递消息（但目前是单板方案）
 #ifdef CHASSIS_BOARD
@@ -665,6 +678,12 @@ void ChassisTask()
     // 根据裁判系统的反馈数据和电容数据对输出限幅并设定闭环参考值
     LimitChassisOutput();
 
+    WorkMode cap_mode = (chassis_cmd_recv.chassis_mode == CHASSIS_ZERO_FORCE) ? MODE_SILENT : MODE_WORK;
+    // 电容充满(≥24V)且底盘功率≤30W:缓冲能量足够带负载,电容无需出力,静默关闭
+    if (cap->cap_msg.cap_voltage >= SUPER_CAP_FULL_VOLTAGE && chassis_pid_totaloutput <= SUPER_CAP_OFF_CHASSIS_POWER)
+        cap_mode = MODE_SILENT;
+    uint8_t chassis_output_enable = (referee_data != NULL) ? referee_data->GameRobotState.mains_power_chassis_output : 1;
+    SuperCapControl(cap, (uint8_t)chassis_power_limit, cap_mode, chassis_output_enable);
 
     // // 获取裁判系统数据   建议将裁判系统与底盘分离，所以此处数据应使用消息中心发送
     // // 我方颜色id小于7是红色,大于7是蓝色,注意这里发送的是对方的颜色, 0:blue , 1:red
