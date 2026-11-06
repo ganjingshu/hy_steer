@@ -132,7 +132,7 @@ void ShootInit()
                 .Kp = 10, // 10
                 .Ki = 10,
                 .Kd = 0,
-                .MaxOut = 500,
+                .MaxOut = 2000, // 角度环输出上限=反拨/单发速度上限(°/s):2000时一个弹位约0.9s,嫌慢可再调大
                 .Improve = PID_Integral_Limit | PID_DerivativeFilter,
                 .IntegralLimit = 20000,
             },
@@ -240,7 +240,7 @@ void ShootTask()
     }
 
     // 卡弹检测:拨盘电流超阈值自动反拨一个弹位(见LoaderJamReverse),反拨动作覆盖本周期load_mode设定
-    // LoaderJamReverse();
+    LoaderJamReverse();
 
     // 确定是否开启摩擦轮,后续可能修改为键鼠模式下始终开启摩擦轮(上场时建议一直开启)
     if (shoot_cmd_recv.friction_mode == FRICTION_ON)
