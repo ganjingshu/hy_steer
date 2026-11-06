@@ -24,9 +24,10 @@ static float hibernate_time = 0, dead_time = 0;
 
 /* 拨盘卡弹检测与反拨:电流超阈值触发,反拨一个弹位后恢复 */
 #define LOADER_JAM_CURRENT 7000     // 拨盘2006电流阈值(原始值),超过判为卡弹
-#define LOADER_REVERSE_ARRIVE 90.0f // 反拨到位判定:与目标角误差(°)
-#define LOADER_REVERSE_TIMEOUT 4000 // 反拨超时(ms),防止未到位一直反拨
+#define LOADER_REVERSE_ARRIVE 5.0f // 反拨到位判定:与目标角误差(°)
+#define LOADER_REVERSE_TIMEOUT 4000 // 反拨超时(ms);角度环上限500°/s反完一个弹位约3.5s,须留够余量
 static uint8_t loader_reversing = 0;     // 反拨状态机标志
+static uint8_t loader_jam_armed = 1;     // 触发使能:电流回落到阈值以下才重新武装
 static uint32_t loader_reverse_start = 0; // 反拨开始时间戳
 static float loader_reverse_target = 0;   // 反拨目标角(触发时锁存,回退一个弹位)
 
@@ -59,9 +60,14 @@ static void LoaderJamReverse()
         return;
     }
 
-    // 未在反拨:电流超阈值即触发反拨,锁存回退一个弹位的目标角
-    if (loader->measure.real_current > LOADER_JAM_CURRENT)
+    // 未在反拨:电流回落到阈值以下重新武装,防反拨-恢复-再反拨的抽搐
+    if (loader->measure.real_current <= LOADER_JAM_CURRENT)
+        loader_jam_armed = 1;
+
+    // 已武装且电流超阈值即触发反拨,锁存回退一个弹位的目标角
+    if (loader_jam_armed && loader->measure.real_current > LOADER_JAM_CURRENT)
     {
+        loader_jam_armed = 0; // 一次卡弹只反拨一次
         loader_reversing = 1;
         loader_reverse_start = DWT_GetTimeline_ms();
         loader_reverse_target = loader->measure.total_angle - ONE_BULLET_DELTA_ANGLE * REDUCTION_RATIO_LOADER;
@@ -139,7 +145,7 @@ void ShootInit()
                 .MaxOut = 20000,
             },
             .current_PID = {
-                .Kp = 0.7, // 0.7
+                .Kp = 0.5, // 0.7
                 .Ki = 0.1, // 0.1
                 .Kd = 0,
                 .Improve = PID_Integral_Limit,
@@ -150,7 +156,7 @@ void ShootInit()
         .controller_setting_init_config = {
             .angle_feedback_source = MOTOR_FEED, .speed_feedback_source = MOTOR_FEED,
             .outer_loop_type = SPEED_LOOP, // 初始化成SPEED_LOOP,让拨盘停在原地,防止拨盘上电时乱转
-            .close_loop_type = CURRENT_LOOP | SPEED_LOOP,
+            .close_loop_type = CURRENT_LOOP | SPEED_LOOP | ANGLE_LOOP, // 必须含ANGLE_LOOP:否则位置环不计算,角度目标直接当速度参考,反拨/单发会全速疯转
             .motor_reverse_flag = MOTOR_DIRECTION_NORMAL, // 注意方向设置为拨盘的拨出的击发方向
         },
         .motor_type = M2006 // 英雄使用m3508
@@ -234,7 +240,7 @@ void ShootTask()
     }
 
     // 卡弹检测:拨盘电流超阈值自动反拨一个弹位(见LoaderJamReverse),反拨动作覆盖本周期load_mode设定
-    LoaderJamReverse();
+    // LoaderJamReverse();
 
     // 确定是否开启摩擦轮,后续可能修改为键鼠模式下始终开启摩擦轮(上场时建议一直开启)
     if (shoot_cmd_recv.friction_mode == FRICTION_ON)
