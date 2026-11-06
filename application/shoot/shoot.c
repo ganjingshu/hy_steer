@@ -22,17 +22,19 @@ uint8_t loader_is_reversing = 0; // 卡弹反转标志,由发射模块在检测�
 // dwt定时,计算冷却用
 static float hibernate_time = 0, dead_time = 0;
 
-/* 拨盘卡弹检测与反拨:电流超阈值触发,反拨一个弹位后恢复 */
+/* 拨盘卡弹检测与反拨:电流超阈值持续0.1s才触发,反拨一个弹位后恢复 */
 #define LOADER_JAM_CURRENT 7000     // 拨盘2006电流阈值(原始值),超过判为卡弹
+#define LOADER_JAM_DWELL_MS 100     // 电流超阈值需持续该时长才判卡弹(ms),滤掉瞬时尖峰
 #define LOADER_REVERSE_ARRIVE 5.0f // 反拨到位判定:与目标角误差(°)
 #define LOADER_REVERSE_TIMEOUT 4000 // 反拨超时(ms);角度环上限500°/s反完一个弹位约3.5s,须留够余量
 static uint8_t loader_reversing = 0;     // 反拨状态机标志
 static uint8_t loader_jam_armed = 1;     // 触发使能:电流回落到阈值以下才重新武装
 static uint32_t loader_reverse_start = 0; // 反拨开始时间戳
+static uint32_t loader_overcurrent_start = 0; // 超阈开始时刻(0=未超阈)
 static float loader_reverse_target = 0;   // 反拨目标角(触发时锁存,回退一个弹位)
 
 /**
- * @brief 拨盘卡弹反拨:监测拨盘2006电流,超过阈值触发反拨一个弹位,
+ * @brief 拨盘卡弹反拨:监测拨盘2006电流,超阈值持续0.1s才触发反拨一个弹位,
  *        到位或超时后恢复load_mode设定;反拨期间置loader_is_reversing供cmd层查询
  * @note  在ShootTask中每周期调用,反拨动作覆盖本周期load_mode对拨盘的设定
  */
@@ -43,6 +45,7 @@ static void LoaderJamReverse()
     {
         loader_reversing = 0;
         loader_is_reversing = 0;
+        loader_overcurrent_start = 0;
         return;
     }
 
@@ -60,20 +63,28 @@ static void LoaderJamReverse()
         return;
     }
 
-    // 未在反拨:电流回落到阈值以下重新武装,防反拨-恢复-再反拨的抽搐
+    // 未在反拨:电流回落到阈值以下重新武装并清零超阈计时,防反拨-恢复-再反拨的抽搐
     if (loader->measure.real_current <= LOADER_JAM_CURRENT)
+    {
         loader_jam_armed = 1;
+        loader_overcurrent_start = 0;
+    }
 
-    // 已武装且电流超阈值即触发反拨,锁存回退一个弹位的目标角
+    // 已武装且电流超阈值:持续0.1s才判为卡弹,触发反拨并锁存回退一个弹位的目标角
     if (loader_jam_armed && loader->measure.real_current > LOADER_JAM_CURRENT)
     {
-        loader_jam_armed = 0; // 一次卡弹只反拨一次
-        loader_reversing = 1;
-        loader_reverse_start = DWT_GetTimeline_ms();
-        loader_reverse_target = loader->measure.total_angle - ONE_BULLET_DELTA_ANGLE * REDUCTION_RATIO_LOADER;
-        loader_is_reversing = 1;
-        DJIMotorOuterLoop(loader, ANGLE_LOOP);
-        DJIMotorSetRef(loader, loader_reverse_target);
+        if (loader_overcurrent_start == 0)
+            loader_overcurrent_start = DWT_GetTimeline_ms(); // 记录超阈开始时刻
+        if (DWT_GetTimeline_ms() - loader_overcurrent_start >= LOADER_JAM_DWELL_MS)
+        {
+            loader_jam_armed = 0; // 一次卡弹只反拨一次
+            loader_reversing = 1;
+            loader_reverse_start = DWT_GetTimeline_ms();
+            loader_reverse_target = loader->measure.total_angle - ONE_BULLET_DELTA_ANGLE * REDUCTION_RATIO_LOADER;
+            loader_is_reversing = 1;
+            DJIMotorOuterLoop(loader, ANGLE_LOOP);
+            DJIMotorSetRef(loader, loader_reverse_target);
+        }
     }
 }
 
@@ -132,7 +143,7 @@ void ShootInit()
                 .Kp = 10, // 10
                 .Ki = 10,
                 .Kd = 0,
-                .MaxOut = 2000, // 角度环输出上限=反拨/单发速度上限(°/s):2000时一个弹位约0.9s,嫌慢可再调大
+                .MaxOut = 5000, // 角度环输出上限=反拨/单发速度上限(°/s):2000时一个弹位约0.9s,嫌慢可再调大
                 .Improve = PID_Integral_Limit | PID_DerivativeFilter,
                 .IntegralLimit = 20000,
             },
