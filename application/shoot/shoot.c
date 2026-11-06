@@ -6,6 +6,8 @@
 #include "bsp_dwt.h"
 #include "general_def.h"
 
+#include <math.h> // 用于fabsf函数
+
 /* 对于双发射机构的机器人,将下面的数据封装成结构体即可,生成两份shoot应用实例 */
 static DJIMotorInstance *friction_l, *friction_r, *loader; // 拨盘电机
 // static servo_instance *lid; 需要增加弹舱盖
@@ -19,6 +21,55 @@ uint8_t loader_is_reversing = 0; // 卡弹反转标志,由发射模块在检测�
 
 // dwt定时,计算冷却用
 static float hibernate_time = 0, dead_time = 0;
+
+/* 拨盘卡弹检测与反拨:电流超阈值触发,反拨一个弹位后恢复 */
+#define LOADER_JAM_CURRENT 7000     // 拨盘2006电流阈值(原始值),超过判为卡弹
+#define LOADER_REVERSE_ARRIVE 90.0f // 反拨到位判定:与目标角误差(°)
+#define LOADER_REVERSE_TIMEOUT 4000 // 反拨超时(ms),防止未到位一直反拨
+static uint8_t loader_reversing = 0;     // 反拨状态机标志
+static uint32_t loader_reverse_start = 0; // 反拨开始时间戳
+static float loader_reverse_target = 0;   // 反拨目标角(触发时锁存,回退一个弹位)
+
+/**
+ * @brief 拨盘卡弹反拨:监测拨盘2006电流,超过阈值触发反拨一个弹位,
+ *        到位或超时后恢复load_mode设定;反拨期间置loader_is_reversing供cmd层查询
+ * @note  在ShootTask中每周期调用,反拨动作覆盖本周期load_mode对拨盘的设定
+ */
+static void LoaderJamReverse()
+{
+    // 急停/关发射时不参与,并复位反拨状态
+    if (shoot_cmd_recv.shoot_mode == SHOOT_OFF)
+    {
+        loader_reversing = 0;
+        loader_is_reversing = 0;
+        return;
+    }
+
+    if (loader_reversing)
+    {
+        // 反拨中:角度环继续回退到锁存的目标角,到位或超时结束
+        DJIMotorOuterLoop(loader, ANGLE_LOOP);
+        DJIMotorSetRef(loader, loader_reverse_target);
+        if (fabsf(loader->measure.total_angle - loader_reverse_target) < LOADER_REVERSE_ARRIVE ||
+            DWT_GetTimeline_ms() - loader_reverse_start > LOADER_REVERSE_TIMEOUT)
+        {
+            loader_reversing = 0;      // 反拨结束,下一周期恢复load_mode设定
+            loader_is_reversing = 0;
+        }
+        return;
+    }
+
+    // 未在反拨:电流超阈值即触发反拨,锁存回退一个弹位的目标角
+    if (loader->measure.real_current > LOADER_JAM_CURRENT)
+    {
+        loader_reversing = 1;
+        loader_reverse_start = DWT_GetTimeline_ms();
+        loader_reverse_target = loader->measure.total_angle - ONE_BULLET_DELTA_ANGLE * REDUCTION_RATIO_LOADER;
+        loader_is_reversing = 1;
+        DJIMotorOuterLoop(loader, ANGLE_LOOP);
+        DJIMotorSetRef(loader, loader_reverse_target);
+    }
+}
 
 void ShootInit()
 {
@@ -72,7 +123,7 @@ void ShootInit()
         .controller_param_init_config = {
             .angle_PID = {
                 // 如果启用位置环来控制发弹,需要较大的I值保证输出力矩的线性度否则出现接近拨出的力矩大幅下降
-                .Kp = 50, // 10
+                .Kp = 10, // 10
                 .Ki = 10,
                 .Kd = 0,
                 .MaxOut = 500,
@@ -80,7 +131,7 @@ void ShootInit()
                 .IntegralLimit = 20000,
             },
             .speed_PID = {
-                .Kp = 10, // 10
+                .Kp = 5, // 10
                 .Ki = 1, // 1
                 .Kd = 0,
                 .Improve = PID_Integral_Limit,
@@ -100,7 +151,7 @@ void ShootInit()
             .angle_feedback_source = MOTOR_FEED, .speed_feedback_source = MOTOR_FEED,
             .outer_loop_type = SPEED_LOOP, // 初始化成SPEED_LOOP,让拨盘停在原地,防止拨盘上电时乱转
             .close_loop_type = CURRENT_LOOP | SPEED_LOOP,
-            .motor_reverse_flag = MOTOR_DIRECTION_REVERSE, // 注意方向设置为拨盘的拨出的击发方向
+            .motor_reverse_flag = MOTOR_DIRECTION_NORMAL, // 注意方向设置为拨盘的拨出的击发方向
         },
         .motor_type = M2006 // 英雄使用m3508
     };
@@ -181,6 +232,9 @@ void ShootTask()
         while (1)
             ; // 未知模式,停止运行,检查指针越界,内存溢出等问题
     }
+
+    // 卡弹检测:拨盘电流超阈值自动反拨一个弹位(见LoaderJamReverse),反拨动作覆盖本周期load_mode设定
+    LoaderJamReverse();
 
     // 确定是否开启摩擦轮,后续可能修改为键鼠模式下始终开启摩擦轮(上场时建议一直开启)
     if (shoot_cmd_recv.friction_mode == FRICTION_ON)
