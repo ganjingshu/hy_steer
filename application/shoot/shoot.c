@@ -39,6 +39,7 @@ static float loader_reverse_target = 0;   // 反拨目标角(触发时锁存,回
  *        到位或超时后恢复load_mode设定;反拨期间置loader_is_reversing供cmd层查询
  * @note  在ShootTask中每周期调用,反拨动作覆盖本周期load_mode对拨盘的设定
  */
+#ifdef ONE_BOARD // 双板时拨盘在底盘板,云台板固件不编译卡弹反拨
 static void LoaderJamReverse()
 {
     // 急停/关发射时不参与,并复位反拨状态
@@ -88,6 +89,7 @@ static void LoaderJamReverse()
         }
     }
 }
+#endif // ONE_BOARD
 
 void ShootInit()
 {
@@ -149,13 +151,17 @@ void ShootTask()
     {
         DJIMotorStop(friction_l);
         DJIMotorStop(friction_r);
+#ifdef ONE_BOARD // 双板时拨盘在底盘板,云台板固件无拨盘电机(loader为NULL),不编译拨盘控制
         DJIMotorStop(loader);
+#endif
     }
     else // 恢复运行
     {
         DJIMotorEnable(friction_l);
         DJIMotorEnable(friction_r);
+#ifdef ONE_BOARD
         DJIMotorEnable(loader);
+#endif
     }
 
     // 如果上一次触发单发或3发指令的时间加上不应期仍然大于当前时间(尚未休眠完毕),直接返回即可
@@ -164,6 +170,7 @@ void ShootTask()
     //     return;
 
     // 若不在休眠状态,根据robotCMD传来的控制模式进行拨盘电机参考值设定和模式切换
+#ifdef ONE_BOARD // 拨盘控制只在单板固件生效;双板时拨盘在底盘板,需另走CANComm转发(待实现)
     switch (shoot_cmd_recv.load_mode)
     {
     // 停止拨盘
@@ -209,9 +216,12 @@ void ShootTask()
         while (1)
             ; // 未知模式,停止运行,检查指针越界,内存溢出等问题
     }
+#endif // ONE_BOARD
 
+#ifdef ONE_BOARD
     // 卡弹检测:拨盘电流超阈值自动反拨一个弹位(见LoaderJamReverse),反拨动作覆盖本周期load_mode设定
     LoaderJamReverse();
+#endif
 
     // 确定是否开启摩擦轮,后续可能修改为键鼠模式下始终开启摩擦轮(上场时建议一直开启)
     if (shoot_cmd_recv.friction_mode == FRICTION_ON)
