@@ -46,6 +46,7 @@
 #include "ins_task.h"
 static CANCommInstance *chasiss_can_comm; // 双板通信CAN comm
 attitude_t *Chassis_IMU_data;
+static DJIMotorInstance *loader, *yaw_motor; // 双板时拨盘(M2006)与yaw(GM6020)在底盘板注册;单板ONE_BOARD时分别由shoot.c/gimbal.c注册
 #endif // CHASSIS_BOARD
 #ifdef ONE_BOARD
 static Publisher_t *chassis_pub;                    // 用于发布底盘的数据
@@ -306,6 +307,93 @@ void ChassisInit()
     // 发布订阅初始化,如果为双板,则需要can comm来传递消息
 #ifdef CHASSIS_BOARD
     Chassis_IMU_data = INS_Init(); // 底盘IMU初始化
+
+    // 双板时拨盘与yaw电机在底盘板注册(单板ONE_BOARD时分别由shoot.c/gimbal.c注册,此处不编译)
+    // DJIMotorInit内已Enable且电机控制任务每周期按pid_ref=0输出,故注册后先Stop防上电乱动;调试时可在调试器里DJIMotorEnable
+    // 拨盘电机(M2006):底盘板hcan2/tx4;控制逻辑在shoot.c,双板时需经CANComm转发(待实现)
+    Motor_Init_Config_s loader_config = {
+        .can_init_config = {
+            .can_handle = &hcan2,
+            .tx_id = 4,
+        },
+        .controller_param_init_config = {
+            .angle_PID = {
+                // 如果启用位置环来控制发弹,需要较大的I值保证输出力矩的线性度否则出现接近拨出的力矩大幅下降
+                .Kp = 35, // 10
+                .Ki = 10,
+                .Kd = 0,
+                .MaxOut = 7000, // 角度环输出上限=反拨/单发速度上限(°/s):2000时一个弹位约0.9s,嫌慢可再调大
+                .Improve = PID_Integral_Limit | PID_DerivativeFilter,
+                .IntegralLimit = 20000,
+            },
+            .speed_PID = {
+                .Kp = 5, // 10
+                .Ki = 1, // 1
+                .Kd = 0,
+                .Improve = PID_Integral_Limit,
+                .IntegralLimit = 5000,
+                .MaxOut = 20000,
+            },
+            .current_PID = {
+                .Kp = 0.5, // 0.7
+                .Ki = 0.1, // 0.1
+                .Kd = 0,
+                .Improve = PID_Integral_Limit,
+                .IntegralLimit = 5000,
+                .MaxOut = 7500,
+            },
+        },
+        .controller_setting_init_config = {
+            .angle_feedback_source = MOTOR_FEED, .speed_feedback_source = MOTOR_FEED,
+            .outer_loop_type = SPEED_LOOP, // 初始化成SPEED_LOOP,让拨盘停在原地,防止拨盘上电时乱转
+            .close_loop_type = CURRENT_LOOP | SPEED_LOOP | ANGLE_LOOP, // 必须含ANGLE_LOOP:否则位置环不计算,角度目标直接当速度参考,反拨/单发会全速疯转
+            .motor_reverse_flag = MOTOR_DIRECTION_NORMAL, // 注意方向设置为拨盘的拨出的击发方向
+        },
+        .motor_type = M2006 // 英雄使用m3508
+    };
+    loader = DJIMotorInit(&loader_config);
+    DJIMotorStop(loader); // 上电不发力,仅保持总线反馈
+
+    // yaw电机(GM6020):底盘板hcan2/tx3,配置与gimbal.c一致,反馈指针用底盘板IMU;双板yaw控制在云台板,此处仅注册供调试
+    Motor_Init_Config_s yaw_config = {
+        .can_init_config = {
+            .can_handle = &hcan2,
+            .tx_id = 0x03,
+        },
+        .controller_param_init_config = {
+            .angle_PID = {
+                .Kp = 48, //
+                .Ki = 150,
+                .Kd = 1,
+                .DeadBand = 0,
+                .Improve = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement | PID_OutputFilter,
+                .IntegralLimit = 0,
+                .Output_LPF_RC = 0.00005,
+                .MaxOut = 2000,
+            },
+            .speed_PID = {
+                .Kp = 36,  // 50
+                .Ki = 100, // 200
+                .Kd = 0,
+                .Improve = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement | PID_OutputFilter,
+                .Output_LPF_RC = 0.00649999983,
+                .IntegralLimit = 2000,
+                .MaxOut = 20000,
+            },
+            .other_angle_feedback_ptr = &Chassis_IMU_data->YawTotalAngle,
+            // 还需要增加角速度额外反馈指针,注意方向,ins_task.md中有c板的bodyframe坐标系说明
+            .other_speed_feedback_ptr = &Chassis_IMU_data->Gyro[2],
+        },
+        .controller_setting_init_config = {
+            .angle_feedback_source = OTHER_FEED,
+            .speed_feedback_source = OTHER_FEED,
+            .outer_loop_type = ANGLE_LOOP,
+            .close_loop_type = ANGLE_LOOP | SPEED_LOOP,
+            .motor_reverse_flag = MOTOR_DIRECTION_REVERSE,
+        },
+        .motor_type = GM6020};
+    yaw_motor = DJIMotorInit(&yaw_config);
+    DJIMotorStop(yaw_motor); // 上电不发力,仅保持总线反馈
 
     CANComm_Init_Config_s comm_conf = {
         .can_config = {
