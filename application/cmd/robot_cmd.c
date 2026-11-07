@@ -60,8 +60,18 @@ float yaw_data;  //开火门控:yaw跟踪误差(°)
 float pitch_data;  //开火门控:pitch跟踪误差(°)
 extern float vision_yaw_angle;
 extern float vision_pitch_angle;
-
 extern uint8_t loader_is_reversing;
+
+static float roll_home_offset = 0;  // 上电时记录
+static uint8_t roll_home_set = 0;
+
+// 在 GimbalTask 首次运行时记录当前位置作为零点
+if (!roll_home_set) {
+    roll_home_offset = roll_motor->measure.total_angle;
+    roll_home_set = 1;
+}
+// 目标角度 = 期望角度 + 上电偏移
+float roll_target = gimbal_cmd_recv.roll + roll_home_offset;
 
 
 static float pitch_vel_data;  //调试变量
@@ -114,7 +124,7 @@ static void CalcOffsetAngle()
 {
     // 别名angle提高可读性,不然太长了不好看,虽然基本不会动这个函数
     static float angle;
-    angle = gimbal_fetch_data.yaw_motor_single_round_angle; // 从云台获取的当前yaw电机单圈角度
+    angle = chassis_fetch_data.yaw_motor_single_round_angle; // yaw电机已由底盘应用控制,从chassis_feed获取当前单圈角度
 #if YAW_ECD_GREATER_THAN_4096                               // 如果大于180度
     if (angle > YAW_ALIGN_ANGLE && angle <= 180.0f + YAW_ALIGN_ANGLE)
         chassis_cmd_send.offset_angle = angle - YAW_ALIGN_ANGLE;
@@ -219,6 +229,12 @@ static void RemoteControlSet()
         gimbal_cmd_send.pitch=PITCH_MIN_ANGLE;
     }
 
+        // 云台软件限位（roll）
+    if (gimbal_cmd_send.roll >= ROLL_MAX_ANGLE)
+        gimbal_cmd_send.roll = ROLL_MAX_ANGLE;
+    else if (gimbal_cmd_send.roll <= ROLL_MIN_ANGLE)
+        gimbal_cmd_send.roll = ROLL_MIN_ANGLE;
+
     // 射击控制（调试与检录用）
     if(switch_is_mid(rc_data[TEMP].rc.switch_left) && switch_is_down(rc_data[TEMP].rc.switch_right))//左开关中，右开关下（摩擦轮关，拨弹关）
     {
@@ -257,7 +273,7 @@ static void RemoteControlSet()
     chassis_cmd_send.vy = 15.0f * (float)rc_data[TEMP].rc.rocker_r_; // 竖直方向
     chassis_cmd_send.wz = 15.0f * (float)rc_data[TEMP].rc.rocker_l_; // 陀螺角度
 
-    shoot_cmd_send.shoot_rate = 8;  //每秒多少发
+    shoot_cmd_send.shoot_rate = 10;  //每秒多少发
 }
 
 

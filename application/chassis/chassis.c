@@ -40,11 +40,13 @@
 /* 电容管理:电容充满(≥24V)且底盘功率≤30W时无需电容出力,静默关闭电容防满电空耗 */
 #define SUPER_CAP_FULL_VOLTAGE 23.8f
 #define SUPER_CAP_OFF_CHASSIS_POWER 30.0f
+/* yaw电机(GM6020)已从gimbal.c移入底盘应用;自由模式下电机编码器零位与云台正方向偏差 */
+#define YAW_START_ANGLE 33.0f
 
 /* 底盘应用包含的模块和信息存储,底盘是单例模式,因此不需要为底盘建立单独的结构体 */
+#include "ins_task.h" // 云台IMU姿态:yaw电机(GM6020)用OTHER_FEED从IMU取角度/角速度
 #ifdef CHASSIS_BOARD // 如果是底盘板,使用板载IMU获取底盘转动角速度
 #include "can_comm.h"
-#include "ins_task.h"
 static CANCommInstance *chasiss_can_comm; // 双板通信CAN comm
 attitude_t *Chassis_IMU_data;
 #endif // CHASSIS_BOARD
@@ -68,6 +70,10 @@ static Shoot_Ctrl_Cmd_s shoot_cmd_recv; // 发射控制命令
 
 static SuperCapInstance *cap;                                       // 超级电容
 static DJIMotorInstance *motor_left, *motor_right, *motor_front, *motor_back, *steer_front, *steer_back; // left right forward back,前后为舵向轮组,左右为全向轮
+static DJIMotorInstance *yaw_motor;   // 云台yaw电机(GM6020,hcan2,tx 0x03),已从gimbal.c移入底盘应用
+static attitude_t *gimbal_IMU_data;   // 云台IMU数据(yaw电机OTHER_FEED的反馈来源,INS单例)
+static Gimbal_Ctrl_Cmd_s gimbal_cmd_recv; // 云台控制命令(yaw目标角度由cmd下发)
+static Subscriber_t *gimbal_sub;      // 订阅"gimbal_cmd"
 
 //调试变量
 static float chassis_lb_v=0; // 底盘前轮(舵向驱动)电机速度
@@ -160,6 +166,7 @@ void ChassisInit()
             .speed_feedback_source = MOTOR_FEED,
             .outer_loop_type = SPEED_LOOP, // 设置为开环，电机设定值由下面的功率控制设定，不走普通的pid
             .close_loop_type = SPEED_LOOP,
+            .feedforward_flag = SPEED_FEEDFORWARD,
         },
         .motor_type = M3508,
     };
@@ -178,8 +185,8 @@ void ChassisInit()
         .can_init_config.can_handle = &hcan1,
         .controller_param_init_config = {
             .speed_PID = {
-                .Kp = 1.2, // 17
-                .Ki = 0.5,   // 3.5
+                .Kp = 1.2, 
+                .Ki = 0.5,  
                 .Kd = 0,   // 0
                 .IntegralLimit = 5000,
                 .Improve = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement,
@@ -192,6 +199,7 @@ void ChassisInit()
             .speed_feedback_source = MOTOR_FEED,
             .outer_loop_type = SPEED_LOOP, // 设置为开环，电机设定值由下面的功率控制设定，不走普通的pid
             .close_loop_type = SPEED_LOOP,
+            .feedforward_flag = SPEED_FEEDFORWARD,
         },
         .motor_type = M3508,
     };
@@ -222,12 +230,12 @@ void ChassisInit()
                 .Kd = 0,   // 0
                 .IntegralLimit = 5000,
                 .Improve = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement,
-                .MaxOut = 10000,
+                .MaxOut = 27000,
                 .Output_LPF_RC = 0.3,
             },
             .angle_PID = {
-                .Kp = 35,//20, // 8
-                .Ki = 60,
+                .Kp = 40,//20, // 8
+                .Ki = 80,
                 .Kd = 0,
                 .DeadBand = 0.1, //死区
                 .Improve = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement,
@@ -240,6 +248,7 @@ void ChassisInit()
             .speed_feedback_source = MOTOR_FEED,
             .outer_loop_type = ANGLE_LOOP,
             .close_loop_type = SPEED_LOOP | ANGLE_LOOP,
+            .feedforward_flag = CURRENT_AND_SPEED_FEEDFORWARD,
             // .power_limit_flag = POWER_LIMIT_ON // 新版电机库无此字段,功率限制由 LimitChassisOutput() 实现
         },
         .motor_type = GM6020,
@@ -301,6 +310,49 @@ void ChassisInit()
     cap_conf.can_config.rx_id = 0x001;
     SuperCapInit(&cap_conf);           // ③ 0x001 安全帧监听实例
 
+    // 云台yaw电机:从gimbal.c移入底盘应用,配置与原来完全一致(GM6020,hcan2,tx 0x03)
+    // 反馈用IMU姿态(OTHER_FEED):angle取YawTotalAngle,speed取Gyro[2],方向约定见ins_task
+    gimbal_IMU_data = INS_Init(); // IMU单例,与gimbal.c的pitch共用
+    Motor_Init_Config_s yaw_config = {
+        .can_init_config = {
+            .can_handle = &hcan2,
+            .tx_id = 0x03,
+        },
+        .controller_param_init_config = {
+            .angle_PID = {
+                .Kp = 60, // 8
+                .Ki = 0,
+                .Kd = 1,
+                .DeadBand = 0,
+                .Improve = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement | PID_OutputFilter,
+                .IntegralLimit = 0,
+                .Output_LPF_RC = 0.00005,
+                .MaxOut = 2000,
+            },
+            .speed_PID = {
+                .Kp = 50,  // 50
+                .Ki = 200, // 200
+                .Kd = 0,
+                .Improve = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement |PID_OutputFilter,
+                .Output_LPF_RC = 0.00649999983,
+                .IntegralLimit = 2000,
+                .MaxOut = 20000,
+            },
+            .other_angle_feedback_ptr = &gimbal_IMU_data->YawTotalAngle,
+            .other_speed_feedback_ptr = &gimbal_IMU_data->Gyro[2],
+        },
+        .controller_setting_init_config = {
+            .angle_feedback_source = OTHER_FEED,
+            .speed_feedback_source = OTHER_FEED,
+            .outer_loop_type = ANGLE_LOOP,
+            .close_loop_type = ANGLE_LOOP | SPEED_LOOP,
+            .motor_reverse_flag = MOTOR_DIRECTION_REVERSE,
+        },
+        .motor_type = GM6020};
+
+    // 电机对total_angle闭环,上电时为零,会保持静止,收到遥控器数据再动
+    yaw_motor = DJIMotorInit(&yaw_config);
+
     // 发布订阅初始化,如果为双板,则需要can comm来传递消息（但目前是单板方案）
 #ifdef CHASSIS_BOARD
     Chassis_IMU_data = INS_Init(); // 底盘IMU初始化
@@ -323,6 +375,9 @@ void ChassisInit()
 
     // 添加发射模块订阅者初始化
     shoot_sub = SubRegister("shoot_cmd", sizeof(Shoot_Ctrl_Cmd_s));
+
+    // yaw电机已由底盘应用控制,订阅cmd的云台控制命令(yaw目标)
+    gimbal_sub = SubRegister("gimbal_cmd", sizeof(Gimbal_Ctrl_Cmd_s));
 #endif // ONE_BOARD
 }
 
@@ -583,6 +638,34 @@ static void ChassisSetRef()
  */
 
 
+/* yaw电机控制:从gimbal.c移入,按云台模式切换反馈源与目标角(与原GimbalTask中yaw分支一致) */
+static void YawMotorControl()
+{
+    switch (gimbal_cmd_recv.gimbal_mode)
+    {
+    // 停止
+    case GIMBAL_ZERO_FORCE:
+        DJIMotorStop(yaw_motor);
+        break;
+    // 使用陀螺仪的反馈,底盘根据yaw电机的offset跟随云台或视觉模式采用
+    case GIMBAL_GYRO_MODE:
+        DJIMotorEnable(yaw_motor);
+        DJIMotorChangeFeed(yaw_motor, ANGLE_LOOP, OTHER_FEED);
+        DJIMotorChangeFeed(yaw_motor, SPEED_LOOP, OTHER_FEED);
+        DJIMotorSetRef(yaw_motor, gimbal_cmd_recv.yaw); // yaw会在robot_cmd中处理好多圈和单圈
+        break;
+    // 云台自由模式,使用编码器反馈,底盘和云台分离,仅云台旋转
+    case GIMBAL_FREE_MODE:
+        DJIMotorEnable(yaw_motor);
+        DJIMotorChangeFeed(yaw_motor, ANGLE_LOOP, MOTOR_FEED);
+        DJIMotorChangeFeed(yaw_motor, SPEED_LOOP, MOTOR_FEED);
+        DJIMotorSetRef(yaw_motor, gimbal_cmd_recv.yaw + YAW_START_ANGLE);
+        break;
+    default:
+        break;
+    }
+}
+
 /* 机器人底盘控制核心任务 */
 void ChassisTask()
 {
@@ -590,6 +673,7 @@ void ChassisTask()
     // 获取新的控制信息
 #ifdef ONE_BOARD
     SubGetMessage(chassis_sub, &chassis_cmd_recv);
+    SubGetMessage(gimbal_sub, &gimbal_cmd_recv);
 #endif
 #ifdef CHASSIS_BOARD
     chassis_cmd_recv = *(Chassis_Ctrl_Cmd_s *)CANCommGet(chasiss_can_comm);
@@ -696,6 +780,9 @@ void ChassisTask()
     uint8_t chassis_output_enable = (referee_data != NULL) ? referee_data->GameRobotState.mains_power_chassis_output : 1;
     SuperCapControl(cap, (uint8_t)chassis_power_limit, cap_mode, chassis_output_enable);
 
+    // yaw电机控制(yaw已从gimbal.c移入底盘应用,按云台模式设定反馈源与目标角)
+    YawMotorControl();
+
     // // 获取裁判系统数据   建议将裁判系统与底盘分离，所以此处数据应使用消息中心发送
     // // 我方颜色id小于7是红色,大于7是蓝色,注意这里发送的是对方的颜色, 0:blue , 1:red
     // chassis_feedback_data.enemy_color = referee_data->GameRobotState.robot_id > 7 ? 1 : 0;
@@ -707,6 +794,9 @@ void ChassisTask()
     chassis_rb_v = motor_back->measure.speed_aps/6.0; // 后舵向驱动
     chassis_lf_v = motor_left->measure.speed_aps/6.0; // 左全向轮
     chassis_rf_v = motor_right->measure.speed_aps/6.0; // 右全向轮
+
+    // yaw电机单圈角度回传cmd(yaw已移入底盘应用,CalcOffsetAngle改从chassis_feed读取)
+    chassis_feedback_data.yaw_motor_single_round_angle = yaw_motor->measure.angle_single_round;
 
     // 推送反馈消息
 #ifdef ONE_BOARD

@@ -32,8 +32,8 @@
 #define PITCH_MAX_ANGLE 20.0f       // 云台竖直方向最大角度 (注意反馈如果是陀螺仪，则填写陀螺仪的角度)
 #define PITCH_MIN_ANGLE -27.0f      // 云台竖直方向最小角度 (注意反馈如果是陀螺仪，则填写陀螺仪的角度)
 #define YAW_HORIZON_ECD 751         // 云台水平位置时的编码器值,这里限制的是小YAW的值
-#define YAW_MAX_ANGLE 62.5f         // 云台水平旋转方向最大角度 (注意反馈如果是陀螺仪，则填写陀螺仪的角度)
-#define YAW_MIN_ANGLE -62.5f        // 云台水平旋转方向最小角度 (注意反馈如果是陀螺仪，则填写陀螺仪的角度)
+#define ROLL_MAX_ANGLE  30.0f    // ROLL上限（根据机械结构确定）
+#define ROLL_MIN_ANGLE -30.0f    // ROLL下限
 // 发射参数
 #define ONE_BULLET_DELTA_ANGLE 36.0f    // 发射一发弹丸拨盘转动的距离,由机械设计图纸给出
 #define REDUCTION_RATIO_LOADER 49.0f // 拨盘电机的减速比,英雄需要修改为3508的19.0f
@@ -167,12 +167,11 @@ typedef struct
 { // 云台角度控制
     float yaw;
     float pitch;
+    float roll;
     float yaw_vel;   // yaw角速度前馈
     float pitch_vel; // pitch角速度前馈
     float roll_vel;  // roll目标转速(纯速度环),单位dps
-    float dm_yaw;
     float chassis_rotate_wz;
-
     gimbal_mode_e gimbal_mode;
 } Gimbal_Ctrl_Cmd_s;
 
@@ -208,13 +207,14 @@ typedef struct
     Bullet_Speed_e bullet_speed; // 弹速限制
     Enemy_Color_e enemy_color;   // 0 for blue, 1 for red
 
+    uint16_t yaw_motor_single_round_angle; // yaw电机单圈角度(yaw由底盘应用控制,经chassis_feed回传给cmd)
+
 } Chassis_Upload_Data_s;
 
 
 typedef struct
 {
     attitude_t gimbal_imu_data;
-    uint16_t yaw_motor_single_round_angle;
 } Gimbal_Upload_Data_s;
 
 typedef struct
