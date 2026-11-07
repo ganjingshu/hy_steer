@@ -248,6 +248,31 @@ typedef struct
     float real_current; // 拨盘电流(原始值)
 } Loader_Feed_Forward_s;
 
+/* ----------------双板yaw控制经CANComm转发---------------- */
+/**
+ * @brief 云台板gimbal.c每周期计算yaw控制量并附上云台IMU的yaw数据,
+ *        经CANComm(0x315)发给底盘板,chassis.c作用于本板注册的yaw电机(GM6020)
+ *
+ */
+typedef struct
+{
+    uint8_t enable;      // 1=DJIMotorEnable,0=DJIMotorStop
+    uint8_t feed;        // Feedback_Source_e:GYRO_MODE→OTHER_FEED,FREE_MODE→MOTOR_FEED
+    float ref;           // 目标角(°):GYRO_MODE为cmd的yaw,FREE_MODE为yaw+YAW_START_ANGLE
+    float imu_yaw_angle; // 云台板IMU的yaw总角(°),供底盘板yaw角度环OTHER_FEED使用
+    float imu_yaw_gyro;  // 云台板IMU的yaw角速度(dps),供底盘板yaw速度环OTHER_FEED使用
+} Yaw_Ctrl_Forward_s;
+
+/**
+ * @brief 底盘板chassis.c经CANComm(0x316)回传yaw电机状态给云台板,
+ *        供gimbal.c反馈与cmd层计算offset
+ *
+ */
+typedef struct
+{
+    float angle_single_round; // yaw电机单圈角(°)
+} Yaw_Feed_Forward_s;
+
 #pragma pack() // 开启字节对齐,结束前面的#pragma pack(1)
 
 #endif // !ROBOT_DEF_H

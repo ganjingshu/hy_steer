@@ -9,11 +9,35 @@
 #include "bmi088.h"
 #include "referee_task.h"
 #include "referee_UI.h"
+#include "can_comm.h"
 
 static attitude_t *gimbal_IMU_data; // 云台IMU数据
+#ifndef GIMBAL_BOARD // 双板时yaw电机在底盘板注册(见chassis.c),云台板不注册,经CANComm转发控制
 static DJIMotorInstance *yaw_motor;
+#endif
 static DMMotorInstance *pitch_motor;
 static LZMotorInstance *roll_motor;
+
+#ifdef GIMBAL_BOARD
+static CANCommInstance *yaw_comm;        // yaw CANComm:云台板发控制量+IMU数据(0x315),收底盘板回传的单圈角(0x316)
+static Yaw_Ctrl_Forward_s yaw_ctrl_send; // 每周期发送给底盘板的yaw控制量
+static Yaw_Feed_Forward_s yaw_feed_recv; // 底盘板回传的yaw电机单圈角
+#endif
+
+/* 统一单板/双板的yaw操作接口:单板直接操作电机;双板(GIMBAL_BOARD)更新CANComm发送结构,GimbalTask末尾统一发送 */
+#ifdef GIMBAL_BOARD
+static void YawStop(void)                        { yaw_ctrl_send.enable = 0; }
+static void YawEnable(void)                      { yaw_ctrl_send.enable = 1; }
+static void YawSetFeed(Feedback_Source_e f)      { yaw_ctrl_send.feed = (uint8_t)f; }
+static void YawSetRef(float r)                   { yaw_ctrl_send.ref = r; }
+static float YawAngleSingleRound(void)           { return yaw_feed_recv.angle_single_round; }
+#else
+static void YawStop(void)                        { DJIMotorStop(yaw_motor); }
+static void YawEnable(void)                      { DJIMotorEnable(yaw_motor); }
+static void YawSetFeed(Feedback_Source_e f)      { DJIMotorChangeFeed(yaw_motor, ANGLE_LOOP, f); DJIMotorChangeFeed(yaw_motor, SPEED_LOOP, f); }
+static void YawSetRef(float r)                   { DJIMotorSetRef(yaw_motor, r); }
+static float YawAngleSingleRound(void)           { return yaw_motor->measure.angle_single_round; }
+#endif
 
 // roll调试变量:目标转速(dps),纯速度环直接给定,volatile可在调试器里实时修改(正式使用前删除)
 static volatile float roll_vel_debug = 0;
@@ -51,7 +75,7 @@ void GimbalInit()
     // ROLL
     Motor_Init_Config_s roll_config = {
         .can_init_config = {
-            .can_handle = &hcan2, // RS00挂在CAN2上,扩展帧tx/rx ID由驱动内部按私有协议设置
+            .can_handle = &hcan1, // RS00挂在CAN2上,扩展帧tx/rx ID由驱动内部按私有协议设置
         },
         .controller_param_init_config = {
             .angle_PID = {
@@ -82,10 +106,11 @@ void GimbalInit()
         },
         .motor_type = LZ};
 
+#ifndef GIMBAL_BOARD // 双板时yaw电机在底盘板注册(见chassis.c),云台板经CANComm转发,不注册
     // YAW
     Motor_Init_Config_s yaw_config = {
         .can_init_config = {
-            .can_handle = &hcan2,
+            .can_handle = &hcan1,
             .tx_id = 0x03,
         },
         .controller_param_init_config = {
@@ -123,11 +148,25 @@ void GimbalInit()
 
     // 电机对total_angle闭环,上电时为零,会保持静止,收到遥控器数据再动
     yaw_motor = DJIMotorInit(&yaw_config);
+#endif // !GIMBAL_BOARD
     pitch_motor = DMMotorInit(&pitch_config);
     roll_motor = LZMotorInit(&roll_config, 3, 4); // RS00电机CAN_ID=3,主机CAN_ID=4
 
     gimbal_pub = PubRegister("gimbal_feed", sizeof(Gimbal_Upload_Data_s));
     gimbal_sub = SubRegister("gimbal_cmd", sizeof(Gimbal_Ctrl_Cmd_s));
+
+#ifdef GIMBAL_BOARD
+    CANComm_Init_Config_s yaw_comm_conf = {
+        .can_config = {
+            .can_handle = &hcan1,
+            .tx_id = 0x315, // 发yaw控制量+云台IMU数据给底盘板
+            .rx_id = 0x316, // 收底盘板回传的yaw电机单圈角
+        },
+        .recv_data_len = sizeof(Yaw_Feed_Forward_s),
+        .send_data_len = sizeof(Yaw_Ctrl_Forward_s),
+    };
+    yaw_comm = CANCommInit(&yaw_comm_conf);
+#endif // GIMBAL_BOARD
 }
 
 /* 机器人云台控制核心任务,后续考虑只保留IMU控制,不再需要电机的反馈 */
@@ -137,34 +176,37 @@ void GimbalTask()
     // 后续增加未收到数据的处理
     SubGetMessage(gimbal_sub, &gimbal_cmd_recv);
 
+#ifdef GIMBAL_BOARD
+    if (yaw_comm->update_flag) // 更新底盘板回传的yaw电机单圈角
+        yaw_feed_recv = *(Yaw_Feed_Forward_s *)CANCommGet(yaw_comm);
+#endif
+
     // 根据控制模式进行电机反馈切换和过渡,视觉模式在robot_cmd模块就已经设置好,gimbal只看yaw_ref和pitch_ref
     switch (gimbal_cmd_recv.gimbal_mode)
     {
     // 停止
     case GIMBAL_ZERO_FORCE:
-        DJIMotorStop(yaw_motor);
+        YawStop();
         DMMotorStop(pitch_motor);
         break;
     // 使用陀螺仪的反馈,底盘根据yaw电机的offset跟随云台或视觉模式采用
     case GIMBAL_GYRO_MODE: // 后续只保留此模式
-        DJIMotorEnable(yaw_motor);
+        YawEnable();
         DMMotorEnable(pitch_motor);
-        DJIMotorChangeFeed(yaw_motor, ANGLE_LOOP, OTHER_FEED);
-        DJIMotorChangeFeed(yaw_motor, SPEED_LOOP, OTHER_FEED);
+        YawSetFeed(OTHER_FEED);
         DMMotorChangeFeed(pitch_motor, ANGLE_LOOP, OTHER_FEED);
         DMMotorChangeFeed(pitch_motor, SPEED_LOOP, OTHER_FEED);
-        DJIMotorSetRef(yaw_motor, gimbal_cmd_recv.yaw); // yaw和pitch会在robot_cmd中处理好多圈和单圈
+        YawSetRef(gimbal_cmd_recv.yaw); // yaw和pitch会在robot_cmd中处理好多圈和单圈
         DMMotorSetRef(pitch_motor, gimbal_cmd_recv.pitch);
         break;
     // 云台自由模式,使用编码器反馈,底盘和云台分离,仅云台旋转,一般用于调整云台姿态(英雄吊射等)/能量机关
     case GIMBAL_FREE_MODE: // 后续删除,或加入云台追地盘的跟随模式(响应速度更快)
-        DJIMotorEnable(yaw_motor);
+        YawEnable();
         DMMotorEnable(pitch_motor);
-        DJIMotorChangeFeed(yaw_motor, ANGLE_LOOP, MOTOR_FEED);
-        DJIMotorChangeFeed(yaw_motor, SPEED_LOOP, MOTOR_FEED);
+        YawSetFeed(MOTOR_FEED);
         DMMotorChangeFeed(pitch_motor, ANGLE_LOOP, MOTOR_FEED);
         DMMotorChangeFeed(pitch_motor, SPEED_LOOP, OTHER_FEED);
-        DJIMotorSetRef(yaw_motor, gimbal_cmd_recv.yaw + YAW_START_ANGLE); // yaw和pitch会在robot_cmd中处理好多圈和单圈
+        YawSetRef(gimbal_cmd_recv.yaw + YAW_START_ANGLE); // yaw和pitch会在robot_cmd中处理好多圈和单圈
         DMMotorSetRef(pitch_motor, gimbal_cmd_recv.pitch);
         break;
     default:
@@ -179,8 +221,15 @@ void GimbalTask()
     // 根据IMU姿态/pitch电机角度反馈计算出当前配重下的重力矩
     // 设置反馈数据,主要是imu和yaw的ecd
     gimbal_feedback_data.gimbal_imu_data = *gimbal_IMU_data;
-    gimbal_feedback_data.yaw_motor_single_round_angle = yaw_motor->measure.angle_single_round;
+    gimbal_feedback_data.yaw_motor_single_round_angle = YawAngleSingleRound();
 
     // 推送消息
     PubPushMessage(gimbal_pub, (void *)&gimbal_feedback_data);
+
+#ifdef GIMBAL_BOARD
+    // yaw控制转发:控制量+云台IMU的yaw数据一起发给底盘板
+    yaw_ctrl_send.imu_yaw_angle = gimbal_IMU_data->YawTotalAngle;
+    yaw_ctrl_send.imu_yaw_gyro = gimbal_IMU_data->Gyro[2];
+    CANCommSend(yaw_comm, (uint8_t *)&yaw_ctrl_send);
+#endif
 }

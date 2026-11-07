@@ -50,6 +50,9 @@ static DJIMotorInstance *loader, *yaw_motor; // 双板时拨盘(M2006)与yaw(GM6
 static CANCommInstance *loader_comm;           // 拨盘CANComm:底盘板收云台板控制量(0x313),回传角度/电流(0x314)
 static Loader_Ctrl_Forward_s loader_ctrl_recv; // 云台板shoot.c发来的拨盘控制量
 static Loader_Feed_Forward_s loader_feed_send; // 回传云台板的拨盘状态
+static CANCommInstance *yaw_comm;              // yaw CANComm:底盘板收云台板控制量+IMU数据(0x315),回传单圈角(0x316)
+static Yaw_Ctrl_Forward_s yaw_ctrl_recv;       // 云台板gimbal.c发来的yaw控制量与IMU数据
+static Yaw_Feed_Forward_s yaw_feed_send;       // 回传云台板的yaw电机单圈角
 #endif // CHASSIS_BOARD
 #ifdef ONE_BOARD
 static Publisher_t *chassis_pub;                    // 用于发布底盘的数据
@@ -357,7 +360,8 @@ void ChassisInit()
     loader = DJIMotorInit(&loader_config);
     DJIMotorStop(loader); // 上电不发力,仅保持总线反馈
 
-    // yaw电机(GM6020):底盘板hcan2/tx3,配置与gimbal.c一致,反馈指针用底盘板IMU;双板yaw控制在云台板,此处仅注册供调试
+    // yaw电机(GM6020):底盘板hcan2/tx3,配置与gimbal.c一致;双板时控制量由云台板gimbal.c经CANComm(0x315)转发,
+    // 角度/速度环OTHER_FEED用转发的云台板IMU数据(指向yaw_ctrl_recv中的字段),ChassisTask每周期作用并回传单圈角(0x316)
     Motor_Init_Config_s yaw_config = {
         .can_init_config = {
             .can_handle = &hcan2,
@@ -383,9 +387,9 @@ void ChassisInit()
                 .IntegralLimit = 2000,
                 .MaxOut = 20000,
             },
-            .other_angle_feedback_ptr = &Chassis_IMU_data->YawTotalAngle,
+            .other_angle_feedback_ptr = &yaw_ctrl_recv.imu_yaw_angle, // 转发的云台板IMU yaw总角
             // 还需要增加角速度额外反馈指针,注意方向,ins_task.md中有c板的bodyframe坐标系说明
-            .other_speed_feedback_ptr = &Chassis_IMU_data->Gyro[2],
+            .other_speed_feedback_ptr = &yaw_ctrl_recv.imu_yaw_gyro, // 转发的云台板IMU yaw角速度
         },
         .controller_setting_init_config = {
             .angle_feedback_source = OTHER_FEED,
@@ -420,6 +424,18 @@ void ChassisInit()
         .daemon_count = 10, // 100Hz守护进程:约0.1s无新控制帧判离线,ChassisTask中离线即停拨盘
     };
     loader_comm = CANCommInit(&loader_comm_conf);
+
+    CANComm_Init_Config_s yaw_comm_conf = {
+        .can_config = {
+            .can_handle = &hcan3,
+            .tx_id = 0x316, // 回传yaw电机单圈角给云台板
+            .rx_id = 0x315, // 收云台板gimbal.c发来的yaw控制量与IMU数据
+        },
+        .recv_data_len = sizeof(Yaw_Ctrl_Forward_s),
+        .send_data_len = sizeof(Yaw_Feed_Forward_s),
+        .daemon_count = 10, // 100Hz守护进程:约0.1s无新控制帧判离线,ChassisTask中离线即停yaw
+    };
+    yaw_comm = CANCommInit(&yaw_comm_conf);
 #endif                                          // CHASSIS_BOARD
 
 #ifdef ONE_BOARD // 单板控制整车,则通过pubsub来传递消息
@@ -710,6 +726,20 @@ void ChassisTask()
     loader_feed_send.total_angle = loader->measure.total_angle;
     loader_feed_send.real_current = loader->measure.real_current;
     CANCommSend(loader_comm, (uint8_t *)&loader_feed_send);
+
+    // yaw控制转发:作用于云台板gimbal.c发来的控制量,反馈按模式用转发的云台IMU或电机编码器;离线即停
+    if (yaw_comm->update_flag)
+        yaw_ctrl_recv = *(Yaw_Ctrl_Forward_s *)CANCommGet(yaw_comm);
+    DJIMotorChangeFeed(yaw_motor, ANGLE_LOOP, (Feedback_Source_e)yaw_ctrl_recv.feed);
+    DJIMotorChangeFeed(yaw_motor, SPEED_LOOP, (Feedback_Source_e)yaw_ctrl_recv.feed);
+    DJIMotorSetRef(yaw_motor, yaw_ctrl_recv.ref);
+    if (yaw_ctrl_recv.enable && CANCommIsOnline(yaw_comm))
+        DJIMotorEnable(yaw_motor);
+    else
+        DJIMotorStop(yaw_motor);
+    // 回传yaw电机单圈角,供云台板gimbal.c反馈与cmd层计算底盘跟随offset
+    yaw_feed_send.angle_single_round = yaw_motor->measure.angle_single_round;
+    CANCommSend(yaw_comm, (uint8_t *)&yaw_feed_send);
 #endif // CHASSIS_BOARD
 
 
