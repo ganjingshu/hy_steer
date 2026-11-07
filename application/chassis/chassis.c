@@ -67,7 +67,6 @@ static Shoot_Ctrl_Cmd_s shoot_cmd_recv; // 发射控制命令
 
 static SuperCapInstance *cap;                                       // 超级电容
 static DJIMotorInstance *motor_left, *motor_right, *motor_front, *motor_back, *steer_front, *steer_back; // left right forward back,前后为舵向轮组,左右为全向轮
-DJIMotorInstance *loader;          // 拨盘电机(M2006):在底盘板注册(hcan2),由发射应用shoot.c控制
 
 //调试变量
 static float chassis_lb_v=0; // 底盘前轮(舵向驱动)电机速度
@@ -303,49 +302,6 @@ void ChassisInit()
     cap_conf.can_config.tx_id = 0x001; // 安全帧(只收)
     cap_conf.can_config.rx_id = 0x001;
     SuperCapInit(&cap_conf);           // ③ 0x001 安全帧监听实例
-
-    // 拨盘电机(M2006):在底盘板注册,控制逻辑仍由发射应用shoot.c执行(loader指针全局共享)
-    Motor_Init_Config_s loader_config = {
-        .can_init_config = {
-            .can_handle = &hcan2,
-            .tx_id = 4,
-        },
-        .controller_param_init_config = {
-            .angle_PID = {
-                // 如果启用位置环来控制发弹,需要较大的I值保证输出力矩的线性度否则出现接近拨出的力矩大幅下降
-                .Kp = 35, // 10
-                .Ki = 10,
-                .Kd = 0,
-                .MaxOut = 7000, // 角度环输出上限=反拨/单发速度上限(°/s):2000时一个弹位约0.9s,嫌慢可再调大
-                .Improve = PID_Integral_Limit | PID_DerivativeFilter,
-                .IntegralLimit = 20000,
-            },
-            .speed_PID = {
-                .Kp = 5, // 10
-                .Ki = 1, // 1
-                .Kd = 0,
-                .Improve = PID_Integral_Limit,
-                .IntegralLimit = 5000,
-                .MaxOut = 20000,
-            },
-            .current_PID = {
-                .Kp = 0.5, // 0.7
-                .Ki = 0.1, // 0.1
-                .Kd = 0,
-                .Improve = PID_Integral_Limit,
-                .IntegralLimit = 5000,
-                .MaxOut = 7500,
-            },
-        },
-        .controller_setting_init_config = {
-            .angle_feedback_source = MOTOR_FEED, .speed_feedback_source = MOTOR_FEED,
-            .outer_loop_type = SPEED_LOOP, // 初始化成SPEED_LOOP,让拨盘停在原地,防止拨盘上电时乱转
-            .close_loop_type = CURRENT_LOOP | SPEED_LOOP | ANGLE_LOOP, // 必须含ANGLE_LOOP:否则位置环不计算,角度目标直接当速度参考,反拨/单发会全速疯转
-            .motor_reverse_flag = MOTOR_DIRECTION_NORMAL, // 注意方向设置为拨盘的拨出的击发方向
-        },
-        .motor_type = M2006 
-    };
-    loader = DJIMotorInit(&loader_config);
 
     // 发布订阅初始化,如果为双板,则需要can comm来传递消息
 #ifdef CHASSIS_BOARD

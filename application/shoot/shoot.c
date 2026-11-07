@@ -9,8 +9,7 @@
 #include <math.h> // 用于fabsf函数
 
 /* 对于双发射机构的机器人,将下面的数据封装成结构体即可,生成两份shoot应用实例 */
-static DJIMotorInstance *friction_l, *friction_r;
-extern DJIMotorInstance *loader; // 拨盘电机:由底盘应用chassis.c注册(hcan2),发射应用负责控制
+static DJIMotorInstance *friction_l, *friction_r, *loader; // 拨盘电机
 // static servo_instance *lid; 需要增加弹舱盖
 
 static Publisher_t *shoot_pub;
@@ -39,7 +38,6 @@ static float loader_reverse_target = 0;   // 反拨目标角(触发时锁存,回
  *        到位或超时后恢复load_mode设定;反拨期间置loader_is_reversing供cmd层查询
  * @note  在ShootTask中每周期调用,反拨动作覆盖本周期load_mode对拨盘的设定
  */
-#ifdef ONE_BOARD // 双板时拨盘在底盘板,云台板固件不编译卡弹反拨
 static void LoaderJamReverse()
 {
     // 急停/关发射时不参与,并复位反拨状态
@@ -89,7 +87,6 @@ static void LoaderJamReverse()
         }
     }
 }
-#endif // ONE_BOARD
 
 void ShootInit()
 {
@@ -134,7 +131,48 @@ void ShootInit()
     friction_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
     friction_r = DJIMotorInit(&friction_config);
 
-    // 拨盘电机(M2006)已移入底盘应用chassis.c注册,这里不再初始化
+    // 拨盘电机
+    Motor_Init_Config_s loader_config = {
+        .can_init_config = {
+            .can_handle = &hcan1,
+            .tx_id = 8,
+        },
+        .controller_param_init_config = {
+            .angle_PID = {
+                // 如果启用位置环来控制发弹,需要较大的I值保证输出力矩的线性度否则出现接近拨出的力矩大幅下降
+                .Kp = 35, // 10
+                .Ki = 10,
+                .Kd = 0,
+                .MaxOut = 7000, // 角度环输出上限=反拨/单发速度上限(°/s):2000时一个弹位约0.9s,嫌慢可再调大
+                .Improve = PID_Integral_Limit | PID_DerivativeFilter,
+                .IntegralLimit = 20000,
+            },
+            .speed_PID = {
+                .Kp = 5, // 10
+                .Ki = 1, // 1
+                .Kd = 0,
+                .Improve = PID_Integral_Limit,
+                .IntegralLimit = 5000,
+                .MaxOut = 20000,
+            },
+            .current_PID = {
+                .Kp = 0.5, // 0.7
+                .Ki = 0.1, // 0.1
+                .Kd = 0,
+                .Improve = PID_Integral_Limit,
+                .IntegralLimit = 5000,
+                .MaxOut = 7500,
+            },
+        },
+        .controller_setting_init_config = {
+            .angle_feedback_source = MOTOR_FEED, .speed_feedback_source = MOTOR_FEED,
+            .outer_loop_type = SPEED_LOOP, // 初始化成SPEED_LOOP,让拨盘停在原地,防止拨盘上电时乱转
+            .close_loop_type = CURRENT_LOOP | SPEED_LOOP | ANGLE_LOOP, // 必须含ANGLE_LOOP:否则位置环不计算,角度目标直接当速度参考,反拨/单发会全速疯转
+            .motor_reverse_flag = MOTOR_DIRECTION_NORMAL, // 注意方向设置为拨盘的拨出的击发方向
+        },
+        .motor_type = M2006 // 英雄使用m3508
+    };
+    loader = DJIMotorInit(&loader_config);
 
     shoot_pub = PubRegister("shoot_feed", sizeof(Shoot_Upload_Data_s));
     shoot_sub = SubRegister("shoot_cmd", sizeof(Shoot_Ctrl_Cmd_s));         
@@ -151,17 +189,13 @@ void ShootTask()
     {
         DJIMotorStop(friction_l);
         DJIMotorStop(friction_r);
-#ifdef ONE_BOARD // 双板时拨盘在底盘板,云台板固件无拨盘电机(loader为NULL),不编译拨盘控制
         DJIMotorStop(loader);
-#endif
     }
     else // 恢复运行
     {
         DJIMotorEnable(friction_l);
         DJIMotorEnable(friction_r);
-#ifdef ONE_BOARD
         DJIMotorEnable(loader);
-#endif
     }
 
     // 如果上一次触发单发或3发指令的时间加上不应期仍然大于当前时间(尚未休眠完毕),直接返回即可
@@ -170,7 +204,6 @@ void ShootTask()
     //     return;
 
     // 若不在休眠状态,根据robotCMD传来的控制模式进行拨盘电机参考值设定和模式切换
-#ifdef ONE_BOARD // 拨盘控制只在单板固件生效;双板时拨盘在底盘板,需另走CANComm转发(待实现)
     switch (shoot_cmd_recv.load_mode)
     {
     // 停止拨盘
@@ -216,12 +249,9 @@ void ShootTask()
         while (1)
             ; // 未知模式,停止运行,检查指针越界,内存溢出等问题
     }
-#endif // ONE_BOARD
 
-#ifdef ONE_BOARD
     // 卡弹检测:拨盘电流超阈值自动反拨一个弹位(见LoaderJamReverse),反拨动作覆盖本周期load_mode设定
     LoaderJamReverse();
-#endif
 
     // 确定是否开启摩擦轮,后续可能修改为键鼠模式下始终开启摩擦轮(上场时建议一直开启)
     if (shoot_cmd_recv.friction_mode == FRICTION_ON)
