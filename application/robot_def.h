@@ -224,6 +224,30 @@ typedef struct
     // ...
 } Shoot_Upload_Data_s;
 
+/* ----------------双板拨盘控制经CANComm转发---------------- */
+/**
+ * @brief 云台板shoot.c每周期计算拨盘控制量经CANComm(0x313)发给底盘板,
+ *        底盘板chassis.c作用于本板注册的拨盘电机
+ *
+ */
+typedef struct
+{
+    uint8_t enable;     // 1=DJIMotorEnable,0=DJIMotorStop
+    uint8_t outer_loop; // Closeloop_Type_e:SPEED_LOOP或ANGLE_LOOP
+    float ref;          // 目标多圈角(°)/目标速度(dps)
+} Loader_Ctrl_Forward_s;
+
+/**
+ * @brief 底盘板chassis.c经CANComm(0x314)回传拨盘状态给云台板,
+ *        供shoot.c卡弹检测与反馈使用
+ *
+ */
+typedef struct
+{
+    float total_angle;  // 拨盘多圈角(°)
+    float real_current; // 拨盘电流(原始值)
+} Loader_Feed_Forward_s;
+
 #pragma pack() // 开启字节对齐,结束前面的#pragma pack(1)
 
 #endif // !ROBOT_DEF_H

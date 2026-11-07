@@ -47,6 +47,9 @@
 static CANCommInstance *chasiss_can_comm; // 双板通信CAN comm
 attitude_t *Chassis_IMU_data;
 static DJIMotorInstance *loader, *yaw_motor; // 双板时拨盘(M2006)与yaw(GM6020)在底盘板注册;单板ONE_BOARD时分别由shoot.c/gimbal.c注册
+static CANCommInstance *loader_comm;           // 拨盘CANComm:底盘板收云台板控制量(0x313),回传角度/电流(0x314)
+static Loader_Ctrl_Forward_s loader_ctrl_recv; // 云台板shoot.c发来的拨盘控制量
+static Loader_Feed_Forward_s loader_feed_send; // 回传云台板的拨盘状态
 #endif // CHASSIS_BOARD
 #ifdef ONE_BOARD
 static Publisher_t *chassis_pub;                    // 用于发布底盘的数据
@@ -310,7 +313,7 @@ void ChassisInit()
 
     // 双板时拨盘与yaw电机在底盘板注册(单板ONE_BOARD时分别由shoot.c/gimbal.c注册,此处不编译)
     // DJIMotorInit内已Enable且电机控制任务每周期按pid_ref=0输出,故注册后先Stop防上电乱动;调试时可在调试器里DJIMotorEnable
-    // 拨盘电机(M2006):底盘板hcan2/tx4;控制逻辑在shoot.c,双板时需经CANComm转发(待实现)
+    // 拨盘电机(M2006):底盘板hcan2/tx4;控制量由云台板shoot.c经CANComm(0x313)转发,ChassisTask每周期作用于电机并回传角度/电流(0x314)
     Motor_Init_Config_s loader_config = {
         .can_init_config = {
             .can_handle = &hcan2,
@@ -405,6 +408,18 @@ void ChassisInit()
         .send_data_len = sizeof(Chassis_Upload_Data_s),
     };
     chasiss_can_comm = CANCommInit(&comm_conf); // can comm初始化
+
+    CANComm_Init_Config_s loader_comm_conf = {
+        .can_config = {
+            .can_handle = &hcan3,
+            .tx_id = 0x314, // 回传拨盘角度/电流给云台板
+            .rx_id = 0x313, // 收云台板shoot.c发来的拨盘控制量
+        },
+        .recv_data_len = sizeof(Loader_Ctrl_Forward_s),
+        .send_data_len = sizeof(Loader_Feed_Forward_s),
+        .daemon_count = 10, // 100Hz守护进程:约0.1s无新控制帧判离线,ChassisTask中离线即停拨盘
+    };
+    loader_comm = CANCommInit(&loader_comm_conf);
 #endif                                          // CHASSIS_BOARD
 
 #ifdef ONE_BOARD // 单板控制整车,则通过pubsub来传递消息
@@ -681,6 +696,20 @@ void ChassisTask()
 #endif
 #ifdef CHASSIS_BOARD
     chassis_cmd_recv = *(Chassis_Ctrl_Cmd_s *)CANCommGet(chasiss_can_comm);
+
+    // 拨盘控制转发:作用于云台板shoot.c计算好的控制量;云台板离线或关发射时停止拨盘
+    if (loader_comm->update_flag)
+        loader_ctrl_recv = *(Loader_Ctrl_Forward_s *)CANCommGet(loader_comm);
+    DJIMotorOuterLoop(loader, (Closeloop_Type_e)loader_ctrl_recv.outer_loop);
+    DJIMotorSetRef(loader, loader_ctrl_recv.ref);
+    if (loader_ctrl_recv.enable && CANCommIsOnline(loader_comm))
+        DJIMotorEnable(loader);
+    else
+        DJIMotorStop(loader);
+    // 回传拨盘角度/电流,供云台板shoot.c卡弹检测与反馈使用
+    loader_feed_send.total_angle = loader->measure.total_angle;
+    loader_feed_send.real_current = loader->measure.real_current;
+    CANCommSend(loader_comm, (uint8_t *)&loader_feed_send);
 #endif // CHASSIS_BOARD
 
 
