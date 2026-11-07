@@ -19,6 +19,9 @@
 #define YAW_ALIGN_ANGLE (YAW_CHASSIS_ALIGN_ECD * ECD_ANGLE_COEF_DJI) // 对齐时的角度,0-360
 #define PTICH_HORIZON_ANGLE (PITCH_HORIZON_ECD * ECD_ANGLE_COEF_DJI) // pitch水平时电机的角度,0-360
 #define AIM_ERROR_MAX 0.8f // 允许开火时云台跟踪误差阈值(°),实车可调
+#define ROLL_HOME_OFFSET 0.0f  // 上电时记录的roll电机角度偏移,用于计算目标角度
+
+
 
 /* cmd应用包含的模块实例指针和交互信息存储*/
 #ifdef GIMBAL_BOARD // 对双板的兼容,条件编译
@@ -62,16 +65,7 @@ extern float vision_yaw_angle;
 extern float vision_pitch_angle;
 extern uint8_t loader_is_reversing;
 
-static float roll_home_offset = 0;  // 上电时记录
-static uint8_t roll_home_set = 0;
 
-// 在 GimbalTask 首次运行时记录当前位置作为零点
-if (!roll_home_set) {
-    roll_home_offset = roll_motor->measure.total_angle;
-    roll_home_set = 1;
-}
-// 目标角度 = 期望角度 + 上电偏移
-float roll_target = gimbal_cmd_recv.roll + roll_home_offset;
 
 
 static float pitch_vel_data;  //调试变量
@@ -124,7 +118,7 @@ static void CalcOffsetAngle()
 {
     // 别名angle提高可读性,不然太长了不好看,虽然基本不会动这个函数
     static float angle;
-    angle = chassis_fetch_data.yaw_motor_single_round_angle; // yaw电机已由底盘应用控制,从chassis_feed获取当前单圈角度
+    angle = gimbal_fetch_data.yaw_motor_single_round_angle; // 从云台获取的当前yaw电机单圈角度
 #if YAW_ECD_GREATER_THAN_4096                               // 如果大于180度
     if (angle > YAW_ALIGN_ANGLE && angle <= 180.0f + YAW_ALIGN_ANGLE)
         chassis_cmd_send.offset_angle = angle - YAW_ALIGN_ANGLE;
@@ -165,38 +159,24 @@ float chassis_speed_rocker=0;//十级10000
 static void RemoteControlSet()
 {
 
-
-
-
-  // 控制底盘和云台运行模式,云台待添加,云台是否始终使用IMU数据?
     if (switch_is_down(rc_data[TEMP].rc.switch_left) && switch_is_down(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[下],底盘跟随云台
     {
-        // chassis_cmd_send.chassis_mode = CHASSIS_FOLLOW_GIMBAL_YAW;
-        // gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
-        
         chassis_cmd_send.chassis_mode = CHASSIS_FOLLOW_GIMBAL_YAW;//底盘云台分离
         gimbal_cmd_send.gimbal_mode = GIMBAL_FREE_MODE;
-
-
     }
     else if (switch_is_down(rc_data[TEMP].rc.switch_left) && switch_is_mid(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[中],底盘和云台分离,底盘保持不转动
     {   
         chassis_cmd_send.chassis_mode = CHASSIS_ROTATE;
-        gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
-        
+        gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;       
     }
     else if (switch_is_down(rc_data[TEMP].rc.switch_left) && switch_is_up(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[上],底盘和云台分离,底盘使用IMU数据
     {
         chassis_cmd_send.chassis_mode = CHASSIS_NO_FOLLOW;
         gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
-
-        // chassis_cmd_send.chassis_mode = CHASSIS_NO_FOLLOW;//底盘云台分离
-        // gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
-
     }
 
     // 超级电容总开关:遥控器左上开关拨到[上]=开启电容,[中]/[下]=关闭
-    chassis_cmd_send.super_cap_enable = switch_is_up(rc_data[TEMP].rc.switch_left) ? 1 : 0;
+    chassis_cmd_send.super_cap_enable = switch_is_up(rc_data[TEMP].rc.switch_left && switch_is_up(rc_data[TEMP].rc.switch_right)) ? 1 : 0;
 
     // 云台参数,确定云台控制数据
     if (switch_is_mid(rc_data[TEMP].rc.switch_left)) // 左侧开关状态为[中],视觉模式，目前给发射做调试使用
@@ -235,6 +215,7 @@ static void RemoteControlSet()
     else if (gimbal_cmd_send.roll <= ROLL_MIN_ANGLE)
         gimbal_cmd_send.roll = ROLL_MIN_ANGLE;
 
+
     // 射击控制（调试与检录用）
     if(switch_is_mid(rc_data[TEMP].rc.switch_left) && switch_is_down(rc_data[TEMP].rc.switch_right))//左开关中，右开关下（摩擦轮关，拨弹关）
     {
@@ -251,7 +232,6 @@ static void RemoteControlSet()
     {
         shoot_cmd_send.friction_mode = FRICTION_ON;
         shoot_cmd_send.shoot_mode = SHOOT_ON;
-        //shoot_cmd_send.load_mode=LOAD_stovepipe;//卡弹反拨
 
         // 视觉开火门控:仅当视觉判定就绪(READY_TO_FIRE)且云台跟踪误差足够小时才允许拨弹
         // 视觉丢失/未就绪/误差过大时停拨弹,摩擦轮保持运转以便随时开火
@@ -267,10 +247,18 @@ static void RemoteControlSet()
         // }
     }
     
-
+        if(switch_is_up(rc_data[TEMP].rc.switch_left) && switch_is_down(rc_data[TEMP].rc.switch_right))//左上，右下（roll 30°）
+    {
+        gimbal_cmd_send.roll = 30.0f+ROLL_HOME_OFFSET;
+    }
+    else if(switch_is_up(rc_data[TEMP].rc.switch_left) && switch_is_mid(rc_data[TEMP].rc.switch_right))//左上，右中（roll 回正0°）
+    {
+        gimbal_cmd_send.roll = 0.0f+ROLL_HOME_OFFSET;
+    }
+ 
     // 底盘参数,目前没有加入小陀螺(调试似乎暂时没有必要),系数需要调整
-    chassis_cmd_send.vx = 15.0f * (float)(rc_data[TEMP].rc.rocker_r1); // _水平方向（-11是为了补偿遥控器波杆偏移）  //-11   //*-20
-    chassis_cmd_send.vy = 15.0f * (float)rc_data[TEMP].rc.rocker_r_; // 竖直方向
+    chassis_cmd_send.vx = 20.0f * (float)(rc_data[TEMP].rc.rocker_r1); // _水平方向（-11是为了补偿遥控器波杆偏移）  //-11   //*-20
+    chassis_cmd_send.vy = 20.0f * (float)rc_data[TEMP].rc.rocker_r_; // 竖直方向
     chassis_cmd_send.wz = 15.0f * (float)rc_data[TEMP].rc.rocker_l_; // 陀螺角度
 
     shoot_cmd_send.shoot_rate = 10;  //每秒多少发

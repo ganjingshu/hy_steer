@@ -9,7 +9,8 @@
 #include <math.h> // 用于fabsf函数
 
 /* 对于双发射机构的机器人,将下面的数据封装成结构体即可,生成两份shoot应用实例 */
-static DJIMotorInstance *friction_l, *friction_r, *loader; // 拨盘电机
+static DJIMotorInstance *friction_l, *friction_r;
+extern DJIMotorInstance *loader; // 拨盘电机:由底盘应用chassis.c注册(hcan2),发射应用负责控制
 // static servo_instance *lid; 需要增加弹舱盖
 
 static Publisher_t *shoot_pub;
@@ -26,7 +27,7 @@ static float hibernate_time = 0, dead_time = 0;
 #define LOADER_JAM_CURRENT 7000     // 拨盘2006电流阈值(原始值),超过判为卡弹
 #define LOADER_JAM_DWELL_MS 100     // 电流超阈值需持续该时长才判卡弹(ms),滤掉瞬时尖峰
 #define LOADER_REVERSE_ARRIVE 5.0f // 反拨到位判定:与目标角误差(°)
-#define LOADER_REVERSE_TIMEOUT 4000 // 反拨超时(ms);角度环上限500°/s反完一个弹位约3.5s,须留够余量
+#define LOADER_REVERSE_TIMEOUT 1200 // 反拨超时(ms);角度环上限500°/s反完一个弹位约3.5s,须留够余量
 static uint8_t loader_reversing = 0;     // 反拨状态机标志
 static uint8_t loader_jam_armed = 1;     // 触发使能:电流回落到阈值以下才重新武装
 static uint32_t loader_reverse_start = 0; // 反拨开始时间戳
@@ -123,56 +124,15 @@ void ShootInit()
         .motor_type = M3508
     };
     
-    friction_config.can_init_config.tx_id = 3; // 左摩擦轮,根据实际情况修改txid
+    friction_config.can_init_config.tx_id = 4; // 左摩擦轮,根据实际情况修改txid
     friction_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
     friction_l = DJIMotorInit(&friction_config);
 
-    friction_config.can_init_config.tx_id = 4; // 右摩擦轮,改txid和方向就行
+    friction_config.can_init_config.tx_id = 5; // 右摩擦轮,改txid和方向就行
     friction_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
     friction_r = DJIMotorInit(&friction_config);
 
-    // 拨盘电机
-    Motor_Init_Config_s loader_config = {
-        .can_init_config = {
-            .can_handle = &hcan1,
-            .tx_id = 8,
-        },
-        .controller_param_init_config = {
-            .angle_PID = {
-                // 如果启用位置环来控制发弹,需要较大的I值保证输出力矩的线性度否则出现接近拨出的力矩大幅下降
-                .Kp = 10, // 10
-                .Ki = 10,
-                .Kd = 0,
-                .MaxOut = 5000, // 角度环输出上限=反拨/单发速度上限(°/s):2000时一个弹位约0.9s,嫌慢可再调大
-                .Improve = PID_Integral_Limit | PID_DerivativeFilter,
-                .IntegralLimit = 20000,
-            },
-            .speed_PID = {
-                .Kp = 5, // 10
-                .Ki = 1, // 1
-                .Kd = 0,
-                .Improve = PID_Integral_Limit,
-                .IntegralLimit = 5000,
-                .MaxOut = 20000,
-            },
-            .current_PID = {
-                .Kp = 0.5, // 0.7
-                .Ki = 0.1, // 0.1
-                .Kd = 0,
-                .Improve = PID_Integral_Limit,
-                .IntegralLimit = 5000,
-                .MaxOut = 7500,
-            },
-        },
-        .controller_setting_init_config = {
-            .angle_feedback_source = MOTOR_FEED, .speed_feedback_source = MOTOR_FEED,
-            .outer_loop_type = SPEED_LOOP, // 初始化成SPEED_LOOP,让拨盘停在原地,防止拨盘上电时乱转
-            .close_loop_type = CURRENT_LOOP | SPEED_LOOP | ANGLE_LOOP, // 必须含ANGLE_LOOP:否则位置环不计算,角度目标直接当速度参考,反拨/单发会全速疯转
-            .motor_reverse_flag = MOTOR_DIRECTION_NORMAL, // 注意方向设置为拨盘的拨出的击发方向
-        },
-        .motor_type = M2006 // 英雄使用m3508
-    };
-    loader = DJIMotorInit(&loader_config);
+    // 拨盘电机(M2006)已移入底盘应用chassis.c注册,这里不再初始化
 
     shoot_pub = PubRegister("shoot_feed", sizeof(Shoot_Upload_Data_s));
     shoot_sub = SubRegister("shoot_cmd", sizeof(Shoot_Ctrl_Cmd_s));         

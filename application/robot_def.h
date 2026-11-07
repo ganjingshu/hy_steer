@@ -17,8 +17,8 @@
 #include "stdint.h"
 
 /* 开发板类型定义,烧录时注意不要弄错对应功能;修改定义后需要重新编译,只能存在一个定义! */
-#define ONE_BOARD // 单板控制整车
-// #define CHASSIS_BOARD //底盘板
+// #define ONE_BOARD // 单板控制整车
+#define CHASSIS_BOARD //底盘板
 // #define GIMBAL_BOARD  //云台板
 
 #define VISION_USE_VCP  // 使用虚拟串口发送视觉数据
@@ -207,14 +207,13 @@ typedef struct
     Bullet_Speed_e bullet_speed; // 弹速限制
     Enemy_Color_e enemy_color;   // 0 for blue, 1 for red
 
-    uint16_t yaw_motor_single_round_angle; // yaw电机单圈角度(yaw由底盘应用控制,经chassis_feed回传给cmd)
-
 } Chassis_Upload_Data_s;
 
 
 typedef struct
 {
     attitude_t gimbal_imu_data;
+    uint16_t yaw_motor_single_round_angle;
 } Gimbal_Upload_Data_s;
 
 typedef struct
